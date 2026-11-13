@@ -1,0 +1,29 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.cache/
+output/
+*.egg-info/
+parts-glb/
+models-glb/
+.DS_Store
+Thumbs.db
+.vscode/
+.claude/
+.vscode/
+.obsidian/
+.DS_Store
+prompts-local/
+.ruff_cache/
+.obsidian/
+
+# Project-local tools and official parts installed by setup.sh.
+/bin/*
+!/bin/.gitkeep
+/data/ldraw/
+.env
+.envrc
+/work/
+
+# Reproducible description-table snapshot for regex searches.
+/data/parts-descriptions-full.tsv
