@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -47,14 +48,24 @@ def inverted_pieces(objects):
 class Document:
     """MPD namespace and local dependencies, with .dat files as physical leaves."""
 
-    def __init__(self, path, parts):
+    def __init__(self, path, parts=None, sections=None):
         self.path = Path(path).resolve()
+        if self.path.suffix.casefold() not in {".mpd", ".ldr", ".dat"}:
+            raise ValueError("Input must be an .mpd, .ldr or .dat file")
         self.parts = parts
         self.models = {}
         self.origins = {}
         self.files = set()
+        self.inverted = set()
         self.root = self._read(self.path)
         self._discover(self.root, set())
+        self.available_sections = list(
+            dict.fromkeys(
+                m.name
+                for m in self.models.values()
+                if m is self.root or not m.name.casefold().endswith(".dat")
+            )
+        )
         assemblies = {k: m for k, m in self.models.items() if not k.endswith(".dat")}
         if self.path.suffix.casefold() == ".dat":
             # A DAT's subparts are geometry, not separate manufactured pieces.
@@ -64,7 +75,112 @@ class Document:
         else:
             self.view = replace(self.root)
         self.view.submodels = assemblies
-        self.inverted = set().union(*(inverted_pieces(m.objects) for m in self.models.values()))
+        self.instances = {
+            "root": {
+                "id": "root",
+                "parent_id": None,
+                "kind": "model",
+                "reference": self.root.name,
+                "section": self.root.name,
+                "line": None,
+            }
+        }
+        self.piece_indices = {}
+        self._index(self.view, "root", ())
+        self.selected_ids = self._select(sections)
+
+    def _index(self, model, parent, visiting):
+        """Index parsed placements, stopping at DAT boundaries (including shortcuts)."""
+        key = normalized(model.name)
+        if key in visiting:
+            raise ValueError("Assembly reference cycle: " + " -> ".join((*visiting, key)))
+        for index, piece in enumerate(model.pieces):
+            self.piece_indices[id(piece)] = index
+            instance_id = str(index) if parent == "root" else f"{parent}/{index}"
+            child = self.view.submodels.get(normalized(piece.reference))
+            self.instances[instance_id] = {
+                "id": instance_id,
+                "parent_id": parent,
+                "kind": "submodel" if child is not None else "part",
+                "reference": piece.reference,
+                "section": self.root.name if model is self.view else model.name,
+                "line": model.source_line_for(piece),
+            }
+            if child is not None:
+                self._index(child, instance_id, (*visiting, key))
+
+    def _select(self, sections):
+        selectors = [sections] if isinstance(sections, str) else sections
+        if not selectors:
+            return ["root"]
+        selected = []
+        for selector in selectors:
+            name, separator, instance_id = selector.rpartition(":")
+            if separator:
+                if not name or not instance_id:
+                    raise ValueError(f"Invalid selector {selector!r}; expected SECTION:ID")
+                node = self.instances.get(instance_id)
+                if node is None:
+                    raise ValueError(
+                        f"Unknown instance ID {instance_id!r} for section {name!r}. "
+                        "Use inspect to list instance IDs."
+                    )
+                if node["kind"] == "part":
+                    raise ValueError(f"{selector!r} identifies a part; select a model or submodel")
+                if normalized(node["reference"]) != normalized(name):
+                    raise ValueError(
+                        f"Instance {instance_id!r} belongs to section {node['reference']!r}, "
+                        f"not {name!r}; use {node['reference'] + ':' + instance_id!r}"
+                    )
+                matches = [node["id"]]
+            else:
+                matches = [
+                    n["id"]
+                    for n in self.instances.values()
+                    if n["kind"] != "part" and normalized(n["reference"]) == normalized(selector)
+                ]
+            if not matches:
+                if selector in self.instances:
+                    reference = self.instances[selector]["reference"]
+                    raise ValueError(
+                        f"Bare instance IDs are not accepted; use SECTION:ID, "
+                        f"for example {reference + ':' + selector!r}"
+                    )
+                if normalized(selector) in self.models:
+                    raise ValueError(f"Section {selector!r} has no placements in the root model")
+                raise ValueError(
+                    f"Unknown section or instance {selector!r}. "
+                    f"Available sections: {', '.join(self.available_sections)}. "
+                    "Use inspect to list instance IDs."
+                )
+            if len(matches) > 1:
+                choices = ", ".join(f"{self.instances[i]['reference']}:{i}" for i in matches)
+                raise ValueError(f"Ambiguous section {selector!r}: use SECTION:ID: {choices}")
+            if matches[0] not in selected:
+                selected.append(matches[0])
+        return selected
+
+    def included(self, instance_id):
+        return any(
+            selected == "root" or instance_id == selected or instance_id.startswith(selected + "/")
+            for selected in self.selected_ids
+        )
+
+    def occurrence_id(self, occurrence):
+        return "/".join(str(self.piece_indices[id(p.piece)]) for p in occurrence.path)
+
+    def inventory(self):
+        """JSON inventory requires source files only, not meshes or a parts library."""
+        return {
+            "source": str(self.path),
+            "source_sha256": hashlib.sha256(self.path.read_bytes()).hexdigest(),
+            "source_dependencies": {
+                str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(self.files)
+            },
+            "root_section": self.root.name,
+            "available_sections": self.available_sections,
+            "instances": list(self.instances.values()),
+        }
 
     def _register(self, name, model, path):
         key = normalized(name)
@@ -82,13 +198,15 @@ class Document:
         self.files.add(path)
         for model in (root, *root.submodels.values()):
             self._register(model.name, model, path)
+            # Reference ownership must survive filtering selected occurrences.
+            self.inverted.update(inverted_pieces(model.objects))
         if alias and normalized(alias) != normalized(root.name):
             self._register(alias, root, path)
         return root
 
     def _discover(self, model, visited):
         if id(model) in visited:
-            return  # pyldraw3 traversal / surface expansion reports actual cycles.
+            return  # Instance indexing / surface expansion reports actual cycles.
         visited.add(id(model))
         for obj in model.objects:
             if isinstance(obj, MetaCommand) and obj.type.upper() in {"TEXMAP", "DATA"}:
@@ -129,7 +247,7 @@ class Document:
                     f"Inline faces in assembly {model.name}; place them in a .dat section"
                 )
         try:
-            return list(self.view.iter_occurrences())
+            return [o for o in self.view.iter_occurrences() if self.included(self.occurrence_id(o))]
         except PartError as exc:
             raise ValueError(f"Cannot expand {self.path}: {exc}") from exc
 

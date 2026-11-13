@@ -10,7 +10,7 @@ physical modeling decision cannot be resolved from the task and evidence.
 
 1. `uv sync --locked` installs the pinned environment.
 2. `uv run python examples/106-1.py` reproduces the sample and inspection views.
-3. `uv run pytest -q` checks parsing, transforms, physics and XML round-tripping.
+3. `uv run pytest -q` checks IDs, selection, body boundaries, geometry and XML round-tripping.
 4. `uv run ruff check .` checks maintained code. Source data is excluded.
 
 Use `ldraw_mujoco.import_ldraw()` or the `ldraw-mujoco convert` command to build
@@ -26,6 +26,23 @@ physics construction and simulation/reporting separate; no second backend.
   do not write an independent parser or manually parse original library DATs.
 - Model sections organize CAD sources. They do not prove physical connections.
   DAT subparts/primitives are geometry, not independently moving bricks.
+- IDs are zero-based type-1 placement paths from the full input: `0/46/1`.
+  `root` is the input container. Preserve IDs across selection and parts mode;
+  source/dependency hashes scope IDs to a source revision. Use `inspect` to list
+  IDs before conversion. Every placed part and submodel is identified.
+- Repeat `--section SECTION[:ID]` for a union of specific submodel instances.
+  A name alone must match exactly one placed instance; repeats require `section:id`.
+  Check that the name matches the instance. Reject bare IDs and list qualified
+  selectors in ambiguity errors. Keep raw path IDs in inventories and reports.
+  Preserve full-input transforms, inherited colors and BFC ownership.
+- Default welding groups only the direct DAT parts of each model/submodel
+  instance. Child submodels are independent world-parented free bodies; never
+  weld them to ancestors or siblings. Containers without direct parts have IDs
+  but no empty physics body. Root loose parts share the root's own body.
+- `individual_parts=True` / `--individual-parts` is the only grouping switch,
+  applied to the entire import. Each physical DAT occurrence gets a free body;
+  geometric subparts/primitives stay inside it. Do not restore grouping modes,
+  per-instance overrides, stability workflows or attachment inference.
 - Keep affine source transforms in mesh vertices. Never turn scale/shear into
   a quaternion silently. Preserve BFC winding and mirrored transforms.
 - Visual surfaces have zero mass and no contacts. Group 3 geoms are collision

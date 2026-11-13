@@ -46,4 +46,4 @@ def sample():
     source = root / "data/models-annotated/106-1.mpd"
     if not (root / "data/ldraw/parts").is_dir() or not source.exists():
         pytest.skip("Local LDraw library and 106-1 sample are required")
-    return import_ldraw(source, grouping="top-level")
+    return import_ldraw(source)

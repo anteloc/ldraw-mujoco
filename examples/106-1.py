@@ -1,44 +1,45 @@
-"""Reproduce the sample's portable scene, five-second report and inspection views.
+"""Export full and selected instances, in both modes, with initial inspection views.
 
-Run from any directory with the project environment:
-    uv run python examples/106-1.py
+Run with: uv run python examples/106-1.py
 """
 
 from pathlib import Path
 
 import mujoco
 
-from ldraw_mujoco import import_ldraw
+from ldraw_mujoco import import_ldraw, inspect_ldraw
 from ldraw_mujoco.cli import write_json
-from ldraw_mujoco.simulation import simulate, snapshot
+from ldraw_mujoco.simulation import snapshot
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "output/106-1"
 
 
 def main():
-    result = import_ldraw(ROOT / "data/models-annotated/106-1.mpd", grouping="top-level")
+    source = ROOT / "data/models-annotated/106-1.mpd"
     OUTPUT.mkdir(parents=True, exist_ok=True)
-    scene = OUTPUT / "scene.xml"
-    scene.write_text(result.spec.to_xml())
-    write_json(OUTPUT / "scene.import.json", result.report)
-
-    # Inspect the exported artifact, which is also used by the MCP server.
-    model = mujoco.MjModel.from_xml_path(str(scene))
-    data = mujoco.MjData(model)
-    snapshot(model, data, OUTPUT / "initial.png")
-    car, minifigure = [body["name"] for body in result.report["bodies"]]
-    snapshot(model, data, OUTPUT / "car.png", body=car)
-    snapshot(model, data, OUTPUT / "car-rear.png", body=car, azimuth=-45)
-    snapshot(model, data, OUTPUT / "minifigure.png", body=minifigure)
-
-    data, report = simulate(model, seconds=5, data=data)
-    write_json(OUTPUT / "scene.simulation.json", report)
-    snapshot(model, data, OUTPUT / "final.png")
+    write_json(OUTPUT / "inventory.json", inspect_ldraw(source))
+    selection = ["106 - wheel assembly.ldr:0/46", "106 - Minifig.ldr"]
+    examples = {
+        "scene": {},
+        "car": {"sections": "106 - car.ldr"},
+        "minifigure": {"sections": "106 - Minifig.ldr"},
+        "selection": {"sections": selection},
+        "parts": {"individual_parts": True},
+        "selection-parts": {"sections": selection, "individual_parts": True},
+    }
+    for name, options in examples.items():
+        result = import_ldraw(source, **options)
+        scene = OUTPUT / f"{name}.xml"
+        scene.write_text(result.spec.to_xml())
+        write_json(OUTPUT / f"{name}.import.json", result.report)
+        # Render the portable artifact, also usable by the MCP server.
+        model = mujoco.MjModel.from_xml_path(str(scene))
+        data = mujoco.MjData(model)
+        image = "initial.png" if name == "scene" else f"{name}.png"
+        snapshot(model, data, OUTPUT / image)
+        print(f"{name}: {result.report['occurrence_count']} parts, {model.nbody - 1} bodies")
     print(f"Artifacts: {OUTPUT}")
-    print(f"Numerically valid: {report['numerically_valid']}; contacts: {data.ncon}")
-    if not report["numerically_valid"]:
-        raise SystemExit(1)
 
 
 if __name__ == "__main__":

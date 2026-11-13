@@ -33,6 +33,11 @@ class ImportedModel:
     report: dict
 
 
+def inspect_ldraw(path: str | Path) -> dict:
+    """List model, submodel and part IDs without building meshes or compiling physics."""
+    return Document(path).inventory()
+
+
 def _name(text):
     return re.sub(r"[^a-zA-Z0-9_]+", "_", text).strip("_")[:60] or "model"
 
@@ -56,7 +61,8 @@ def import_ldraw(
     library: str | Path | None = None,
     shadows=None,
     cache: str | Path | None = None,
-    grouping: str = "model",
+    sections: str | list[str] | None = None,
+    individual_parts: bool = False,
     density: float = 1050.0,
     friction: float = 0.6,
     timestep: float = 0.001,
@@ -64,16 +70,19 @@ def import_ldraw(
 ) -> ImportedModel:
     """Import MPD/LDR/DAT geometry; all dimensions exposed here are SI units.
 
-    ``grouping='model'`` makes one rigid body. ``'top-level'`` makes one per
-    root placement, including all its descendants. Neither infers attachments.
+    Each model/submodel instance's direct parts share one free body. Child
+    submodels are independent of their parents. ``individual_parts=True``
+    instead gives every physical part its own free body, never its primitives.
+    ``sections`` accepts unambiguous section names or ``section:id`` selectors.
+    Repeated sections require the latter (see ``inspect_ldraw``), and the name
+    must match the instance. Bare IDs are not accepted. Selection preserves full-input
+    IDs, ancestor transforms and colors; overlapping selections form a union.
     ``shadows=[]`` disables external connector metadata. The returned spec is
     compiled once for validation and is still editable by the caller.
     """
     path = Path(path).resolve()
-    if path.suffix.casefold() not in {".mpd", ".ldr", ".dat"}:
-        raise ValueError("Input must be an .mpd, .ldr or .dat file")
-    if grouping not in {"model", "top-level"}:
-        raise ValueError("grouping must be 'model' or 'top-level'")
+    if not isinstance(individual_parts, bool):
+        raise ValueError("individual_parts must be a boolean")
     for key, value in {
         "density": density,
         "friction": friction,
@@ -83,14 +92,23 @@ def import_ldraw(
         if not np.isfinite(value) or value < 0 or (key in {"density", "timestep"} and value == 0):
             raise ValueError(f"Invalid {key}: {value}")
     parts, library_root, shadow_paths = load_library(library, shadows, cache)
-    document = Document(path, parts)
+    document = Document(path, parts, sections=sections)
     occurrences = document.occurrences()
     if not occurrences:
         raise ValueError(f"No physical part occurrences in {path}")
     surfaces = Surfaces(document)
     warnings, groups, placements, metadata = [], {}, [], {}
+    if individual_parts:
+        warnings.append(
+            {
+                "code": "independent_parts",
+                "message": "Parts have independent free joints and no attachment constraints. "
+                "Convex hulls of assembled parts can overlap and push each other apart.",
+            }
+        )
 
     for index, occ in enumerate(occurrences):
+        instance_id = document.occurrence_id(occ)
         matrix, position = np.array(occ.matrix.rows), vector(occ.position)
         check_transform(matrix, position, occ.reference)
         error = float(np.max(np.abs(matrix.T @ matrix - np.eye(3))))
@@ -99,6 +117,7 @@ def import_ldraw(
                 {
                     "code": "affine_placement",
                     "occurrence": index,
+                    "instance_id": instance_id,
                     "orthogonality_error": error,
                     "message": "Source scale/shear baked into visual and collision vertices",
                 }
@@ -110,18 +129,23 @@ def import_ldraw(
         inversion = sum(id(p.piece) in document.inverted for p in occ.path) % 2
         if (np.linalg.det(matrix) < 0) != bool(inversion):
             triangles = triangles[:, ::-1]
-        root_piece = occ.path[0].piece
-        key = id(root_piece) if grouping == "top-level" else 0
+        if individual_parts:
+            key = instance_id
+            origin = position @ BASIS.T * LDU_TO_METERS
+        else:
+            # Only direct parts belong to this assembly; nested assemblies get
+            # their own world-parented free bodies, with no inter-body welds.
+            key = document.instances[instance_id]["parent_id"]
+            anchor, rotation = np.zeros(3), np.eye(3)
+            for item in occ.path[:-1]:
+                anchor += rotation @ vector(item.piece.position)
+                rotation = rotation @ np.array(item.piece.matrix.rows)
+            origin = anchor @ BASIS.T * LDU_TO_METERS
         if key not in groups:
-            number = len(groups)
-            label = root_piece.reference if grouping == "top-level" else document.root.name
-            origin = (
-                vector(root_piece.position) @ BASIS.T * LDU_TO_METERS
-                if grouping == "top-level"
-                else np.zeros(3)
-            )
+            label = document.instances[key]["reference"]
             groups[key] = {
-                "name": f"body_{number:03d}_{_name(label)}",
+                "name": f"body_{key.replace('/', '_')}_{_name(label)}",
+                "instance_id": key,
                 "source": label,
                 "origin": origin,
                 "occurrences": [],
@@ -186,7 +210,8 @@ def import_ldraw(
     for index, (occ, surface, triangles, key) in enumerate(placements):
         group = groups[key]
         local = triangles - group["origin"]
-        prefix = f"part_{index:03d}_{_name(occ.part_code)}"
+        instance_id = document.occurrence_id(occ)
+        prefix = f"part_{instance_id.replace('/', '_')}_{_name(occ.part_code)}"
         try:
             hull = trimesh.convex.convex_hull(local.reshape(-1, 3))
         except Exception as exc:
@@ -239,6 +264,8 @@ def import_ldraw(
         occurrence_report.append(
             {
                 "index": index,
+                "id": instance_id,
+                "parent_id": document.instances[instance_id]["parent_id"],
                 "reference": occ.reference,
                 "body": group["name"],
                 "colour": occ.colour.code if occ.colour.code is not None else occ.colour.rgb,
@@ -266,6 +293,7 @@ def import_ldraw(
         body_report.append(
             {
                 "name": group["name"],
+                "instance_id": group["instance_id"],
                 "source": group["source"],
                 "occurrence_count": len(group["occurrences"]),
                 "initial_position_m": body.pos.tolist(),
@@ -273,6 +301,8 @@ def import_ldraw(
                 "inertia_kg_m2": body.inertia.tolist(),
             }
         )
+    body_names = {g["instance_id"]: g["name"] for g in groups.values()}
+    body_names.update({o["id"]: o["body"] for o in occurrence_report})
     report = {
         "source": str(path),
         "source_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
@@ -288,7 +318,14 @@ def import_ldraw(
         },
         "library": str(library_root),
         "shadows": shadow_paths,
-        "grouping": grouping,
+        "individual_parts": individual_parts,
+        "selected_instances": document.selected_ids,
+        "available_sections": document.available_sections,
+        "instances": [
+            {**node, "body": body_names.get(node["id"])}
+            for node in document.instances.values()
+            if document.included(node["id"])
+        ],
         "occurrence_count": len(occurrences),
         "unique_parts": len({normalized(o.reference) for o in occurrences}),
         "nq": model.nq,
@@ -312,7 +349,11 @@ def import_ldraw(
             "Rigid grouping is user-selected, not inferred from connectors.",
             "One convex hull per occurrence fills cavities; overlapping hull volumes are counted separately.",
             "Mass, inertia and friction are uncalibrated estimates; all parts use the selected density.",
-            "Wheels and all internal joints are fixed; attachment strength and separation are not modeled.",
+            (
+                "Each physical part is free; there are no welds, clutch forces or articulated connections."
+                if individual_parts
+                else "Each assembly's direct parts are welded; child assemblies remain independent."
+            ),
         ],
     }
     return ImportedModel(spec, report)
