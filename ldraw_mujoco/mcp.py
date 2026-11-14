@@ -66,6 +66,7 @@ class MujocoClient:
         "sim_step",
         "sim_forward",
         "sim_get_state",
+        "sim_set_state",
         "analyze_contacts",
     }
 

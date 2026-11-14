@@ -106,6 +106,8 @@ class Interpreter:
         self.client = None
         self.enabled = []
         self._stack = []
+        self._history = []
+        self._state = None
         self.failed = False
         self.last_result = None
         self._busy = False
@@ -227,6 +229,8 @@ class Interpreter:
             await self._call("sim_reset")
             self.enabled = []
             self._stack = [["root", 0]]
+            self._history.clear()
+            self._state = None
             self._unwind()
             self.failed = False
             result = {"events": [], **self.status}
@@ -243,6 +247,69 @@ class Interpreter:
         self.viewer_error = None
         self._record({"kind": "viewer_open", "realtime": True})
         return result
+
+    def _check_ready(self):
+        if self._busy:
+            raise RuntimeError("Debugger operations must be sequential")
+        if self.failed:
+            raise ExecutionError(
+                "Execution halted; call reset() or reopen", {"events": [], **self.status}
+            )
+
+    async def undo(self):
+        """Undo one successful execution command; reset clears this session's history."""
+        self._check_ready()
+        if not self._history:
+            self.last_result = {"events": [], **self.status, "undone_command": None}
+            return self.last_result
+        checkpoint = self._history[-1]
+        self._busy = True
+        try:
+            if checkpoint["enabled"] != self.enabled:
+                modifications = list(self.inactive)
+                for ident in checkpoint["enabled"]:
+                    modifications.extend(self.activate[ident])
+                await self._call("modify_model", modifications=modifications)
+                state = checkpoint["state"]
+                if state is None:
+                    await self._call("sim_reset")
+                else:
+                    # Every completed trial has the same duration. Keep that
+                    # time; sim_set_state restores motion and refreshes contacts
+                    # and the viewer without advancing physics. Solver caches
+                    # need no checkpoint: the next placement resets them to CAD.
+                    restored = await self._call(
+                        "sim_set_state", qpos=state["qpos"], qvel=state["qvel"]
+                    )
+                    if not math.isclose(restored["time"], state["time"], abs_tol=1e-12):
+                        raise MCPError("Restored simulation time differs from the checkpoint")
+            self.enabled = checkpoint["enabled"]
+            self._stack = checkpoint["stack"]
+            self._state = checkpoint["state"]
+            self._history.pop()
+            self.last_result = {
+                "events": [],
+                **self.status,
+                "undone_command": checkpoint["command"],
+            }
+            self._record({"kind": "undo", **self.last_result})
+            return self.last_result
+        except (Exception, asyncio.CancelledError) as exc:
+            self.failed = True
+            result = {
+                "events": [],
+                **self.status,
+                "error": str(exc),
+                "operation": "undo",
+                "failing_instruction": self.status["next_instruction"],
+            }
+            self.last_result = result
+            self._record({"kind": "error", **result})
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            raise ExecutionError(str(exc), result) from exc
+        finally:
+            self._busy = False
 
     async def _place(self, ident):
         await self._call("sim_reset")
@@ -296,18 +363,20 @@ class Interpreter:
             "contacts": contacts["contacts"],
             "contact_count": contacts["n_contacts"],
         }
+        self._state = state
         return _json_safe(physics)
 
     async def _advance(self, mode):
-        if self._busy:
-            raise RuntimeError("Debugger operations must be sequential")
-        if self.failed:
-            raise ExecutionError(
-                "Execution halted; call reset() or reopen", {"events": [], **self.status}
-            )
+        self._check_ready()
         self._busy = True
         events = []
         depth = len(self._stack)
+        checkpoint = {
+            "command": {"into": "step", "over": "next", "out": "finish", "run": "continue"}[mode],
+            "stack": [frame.copy() for frame in self._stack],
+            "enabled": list(self.enabled),
+            "state": self._state,
+        }
         try:
             while self._stack:
                 instruction = self.status["next_instruction"]
@@ -340,6 +409,8 @@ class Interpreter:
                     or (mode == "out" and len(self._stack) < depth)
                 ):
                     break
+            if events:
+                self._history.append(checkpoint)
             self.last_result = {"events": events, **self.status}
             return self.last_result
         except (Exception, asyncio.CancelledError) as exc:

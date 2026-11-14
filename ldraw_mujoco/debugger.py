@@ -6,7 +6,19 @@ import sys
 from .interpreter import ExecutionError, Interpreter
 from .mcp import MCPError
 
-HELP = "step (s), next (n), finish (f), continue (c), where (w), reset (r), help (h), quit (q)"
+COMMANDS = (
+    "step (s), next (n), undo (u), finish (f), continue (c), "
+    "where (w), reset (r), help (h), quit (q)"
+)
+HELP = """step (s) - Execute one instruction, entering submodels.
+next (n) - Execute the next instruction, completing submodel calls.
+undo (u) - Undo the last step, next, finish, or continue.
+finish (f) - Finish the current submodel; at root, finish the program.
+continue (c) - Execute the rest of the program.
+where (w) - Show the call stack and next instruction.
+reset (r) - Disable all parts, rewind, and clear undo history.
+help (h) - Show this command list.
+quit (q) - Exit the debugger and close its viewer and server."""
 
 
 def describe(status):
@@ -38,6 +50,8 @@ async def terminal(program, *, read=None, write=print):
         "s": program.step_into,
         "next": program.step_over,
         "n": program.step_over,
+        "undo": program.undo,
+        "u": program.undo,
         "finish": program.step_out,
         "f": program.step_out,
         "continue": program.run,
@@ -45,7 +59,7 @@ async def terminal(program, *, read=None, write=print):
         "reset": program.reset,
         "r": program.reset,
     }
-    write(HELP)
+    write(COMMANDS)
     write(describe(program.status))
     while True:
         try:
@@ -61,6 +75,9 @@ async def terminal(program, *, read=None, write=print):
         elif command in methods:
             try:
                 result = await methods[command]()
+                if "undone_command" in result:
+                    undone = result["undone_command"]
+                    write(f"Undid {undone}." if undone else "Nothing to undo.")
                 for event in result["events"]:
                     instruction = event["instruction"]
                     if event["kind"] == "call":
@@ -75,7 +92,7 @@ async def terminal(program, *, read=None, write=print):
             except (ExecutionError, MCPError) as exc:
                 write(f"Execution halted: {exc}. Use reset or quit.")
         elif command:
-            write(f"Unknown command: {command}. {HELP}")
+            write(f"Unknown command: {command}. {COMMANDS}")
 
 
 async def execute(args):

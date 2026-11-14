@@ -58,9 +58,15 @@ async def main():
         await capture(program, "first-part")
         while program.status["next_instruction"]["id"] != "0/19":
             await program.step_over()
+        await capture(program, "before-wheel")
         await program.step_over()  # Wheel call, including both contained DATs.
         await capture(program, "nested-wheel")
         await capture(program, "wheel-detail", selection=["0/19/0", "0/19/1"])
+        await program.undo()  # Undo that whole call, including both parts.
+        assert program.status["next_instruction"]["id"] == "0/19"
+        assert not {"0/19/0", "0/19/1"} & set(program.enabled)
+        await capture(program, "undo-wheel")
+        await program.step_over()  # Execute it again from the restored position.
         await program.step_out()  # Finish the car and return to the root.
         await program.run()  # Place the minifigure and finish the program.
         await capture(program, "completed")

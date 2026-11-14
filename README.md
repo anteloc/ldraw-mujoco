@@ -151,11 +151,13 @@ process connected to an assistant. Ordinary import/conversion needs no extra.
 |---|---|---|
 | `step` / `s` | `step_into()` | Execute a DAT placement or enter a submodel. |
 | `next` / `n` | `step_over()` | Execute a DAT placement or an entire submodel call. |
+| `undo` / `u` | `undo()` | Undo the last step, next, finish, or continue. |
 | `finish` / `f` | `step_out()` | Finish the current submodel; at root, finish the program. |
 | `continue` / `c` | `run()` | Finish the program. |
 | `where` / `w` | `status` property | Show the stack and next instruction. |
-| `reset` / `r` | `reset()` | Disable all parts and rewind. |
-| `help` / `h`, `quit` / `q` | — | Show commands or close the owned server. |
+| `reset` / `r` | `reset()` | Disable all parts, rewind, and clear undo history. |
+| `help` / `h` | — | Show each command with a brief explanation. |
+| `quit` / `q` | — | Close the owned viewer and server. |
 
 Every DAT placement enables one free body. Before each evaluation, **all enabled
 parts return to their original CAD poses with zero velocity**. Physics then
@@ -167,6 +169,14 @@ The full input's common ground offset remains fixed throughout execution.
 Entering a submodel changes only the call stack. Returning is implicit, with
 no subroutine return value. Step over/out still evaluate every contained DAT
 placement and retain every observation. Empty submodels return immediately.
+
+`undo` restores the stack, enabled parts, poses and velocities from before
+the last execution command. For example, `next` on a submodel followed by `u`
+undoes that whole call. Repeating `u` walks further back, including after program
+completion. It does not run physics backward or advance time. `help` and `where`
+do not affect history; `reset` clears it. With no history, `u` does nothing.
+You can execute forward again after undoing. History lasts only for this session;
+execution failures still require `reset` or reopening.
 
 ```python
 import asyncio

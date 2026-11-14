@@ -188,8 +188,22 @@ original stack depth. Step out finishes the current frame; at root it finishes
 the program. Run executes until the stack empties. All operations use the same
 instruction executor and produce ordered call/placement events. Call events
 have no physics observation or source-language return value. Completed programs
-allow harmless further stepping. Reverse execution and persistent sessions are
-not implemented.
+allow harmless further stepping.
+
+`undo()` / `undo (u)` undoes one successful step/next/finish/continue
+command, including the entire work of a compound command. Before execution,
+save a copy of the stack and enabled IDs plus the most recent MCP state response.
+Successful commands with events enter the session's undo history; empty completed
+operations do not. Undo restores original visibility, gravity compensation and
+body/geom contact masks for that enabled set, then uses `sim_set_state` to restore
+saved poses and velocities. Every completed trial has the same duration, so its
+time is preserved and checked. Undoing all placements uses `sim_reset` to return
+to time zero. Undoing a call alone requires no MCP updates. No physics steps run.
+The server recomputes contacts and refreshes the viewer. Solver caches and contact
+forces are not checkpointed; the next placement still resets to CAD before its
+trial. Reset clears history, and undo failures/cancellation halt execution until
+reset. The append-only event log includes `undo` records rather than erasing
+the commands they undo. Persistent sessions and redo are not implemented.
 
 The execution XML retains every mesh and free body. Before exporting it, set
 gravity compensation on every part so MuJoCo initializes its compensation
@@ -226,7 +240,8 @@ the exception/result/log; reset reapplies all inactive settings before rewinding
 Cancellation also marks execution halted. Concurrent debugger operations are
 rejected. Exiting the context closes the owned process and its viewer.
 
-The CLI provides the debugger commands and optional server viewer. Headless
+The CLI provides the debugger commands, one-line explanations through `help`,
+and an optional server viewer. Headless
 operation is fully supported. `Interpreter.open(viewer=True)` selects MuJoCo's
 `mjpython -m mujoco_mcp` launcher on macOS. Its environment includes the base
 Python `LIBDIR` in `DYLD_FALLBACK_LIBRARY_PATH`, avoiding uv virtual-environment

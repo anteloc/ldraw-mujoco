@@ -62,6 +62,9 @@ class NativeClient:
             mujoco.mj_step(m, d, nstep=args["n_steps"])
         elif tool == "sim_get_state":
             return {"time": d.time, "qpos": d.qpos.tolist(), "qvel": d.qvel.tolist()}
+        elif tool == "sim_set_state":
+            d.qpos[:] = args["qpos"]
+            d.qvel[:] = args["qvel"]
         elif tool == "analyze_contacts":
             return {"n_contacts": d.ncon, "contacts": contacts(m, d)[: args["max_contacts"]]}
         elif tool == "viewer_open":
@@ -69,7 +72,7 @@ class NativeClient:
         else:
             assert tool == "sim_forward"
         mujoco.mj_forward(m, d)
-        return {"n_contacts": d.ncon}
+        return {"n_contacts": d.ncon, "time": d.time}
 
 
 @pytest.fixture
@@ -162,6 +165,144 @@ def test_activation_preserves_mass_transparency_and_resets_every_trial(program):
     asyncio.run(check())
 
 
+def test_undo_restores_calls_parts_empty_returns_and_completed_program(program):
+    async def check():
+        client = NativeClient()
+        await program._load(client)
+        count = len(client.calls)
+        assert (await program.undo())["undone_command"] is None
+        assert len(client.calls) == count
+        checkpoints = []
+        for operation in (
+            program.step_into,
+            program.step_into,
+            program.step_over,
+            program.step_into,
+            program.step_out,
+            program.step_into,
+        ):
+            checkpoints.append(
+                (
+                    program.status,
+                    await client.call("sim_get_state"),
+                    client.model.body_gravcomp.copy(),
+                    client.model.body_contype.copy(),
+                    client.model.body_conaffinity.copy(),
+                    client.model.geom_contype.copy(),
+                    client.model.geom_conaffinity.copy(),
+                    client.model.geom_rgba.copy(),
+                )
+            )
+            await operation()
+        assert program.status["done"]
+        await program.run()  # Completed no-ops must not hide the last real command.
+        await program.step_out()
+        for status, state, *fields in reversed(checkpoints):
+            result = await program.undo()
+            assert result["events"] == []
+            assert program.status == status
+            assert await client.call("sim_get_state") == state
+            for name, expected in zip(
+                (
+                    "body_gravcomp",
+                    "body_contype",
+                    "body_conaffinity",
+                    "geom_contype",
+                    "geom_conaffinity",
+                    "geom_rgba",
+                ),
+                fields,
+                strict=True,
+            ):
+                np.testing.assert_array_equal(getattr(client.model, name), expected)
+            allowed = {program.parts[i]["body"] for i in program.enabled} | {"world"}
+            for contact in client.data.contact:
+                assert all(
+                    client.model.body(client.model.geom_bodyid[g]).name in allowed
+                    for g in contact.geom
+                )
+        assert len(client.starts) == 4  # Undo never advances physics.
+        assert client.data.ncon == 0
+        count = len(client.calls)
+        assert (await program.undo())["undone_command"] is None
+        assert len(client.calls) == count
+        records = [
+            json.loads(line)
+            for line in (program.output_dir / "events.jsonl").read_text().splitlines()
+        ]
+        assert len([r for r in records if r["kind"] == "undo"]) == len(checkpoints)
+        await program.run()
+        await program.reset()
+        assert (await program.undo())["undone_command"] is None
+        assert not program.enabled
+
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize(
+    "method, command", [("step_over", "next"), ("step_out", "finish"), ("run", "continue")]
+)
+def test_undo_undoes_whole_command_and_allows_reexecution(program, method, command):
+    async def check():
+        client = NativeClient()
+        await program._load(client)
+        await program.step_into()
+        await program.step_into()
+        before = program.status
+        state = await client.call("sim_get_state")
+        operation = getattr(program, method)
+        first = await operation()
+        result = await program.undo()
+        assert result["undone_command"] == command
+        assert program.status == before
+        assert await client.call("sim_get_state") == state
+        assert await operation() == first
+        await program.undo()
+        await program.undo()
+        assert not program.enabled
+        assert program.status["next_instruction"]["id"] == "0/0"
+
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("failure", ["partial", "state", "cancelled"])
+def test_undo_failure_halts_until_reset(program, failure):
+    async def check():
+        client = NativeClient()
+        await program._load(client)
+        await program.step_into()
+        await program.step_into()
+        await program.run()
+        original = client.call
+
+        async def fail(tool, **args):
+            if failure == "partial" and tool == "modify_model":
+                await original(tool, **{**args, "modifications": args["modifications"][:1]})
+                raise MCPError("partial undo failure")
+            if tool == "sim_set_state":
+                if failure == "cancelled":
+                    raise asyncio.CancelledError()
+                raise MCPError("state undo failure")
+            return await original(tool, **args)
+
+        client.call = fail
+        error = asyncio.CancelledError if failure == "cancelled" else ExecutionError
+        with pytest.raises(error):
+            await program.undo()
+        assert program.failed
+        assert program.last_result["operation"] == "undo"
+        with pytest.raises(ExecutionError, match="halted"):
+            await program.undo()
+        with pytest.raises(ExecutionError, match="halted"):
+            await program.run()
+        client.call = original
+        await program.reset()
+        assert (await program.undo())["undone_command"] is None
+        assert (await program.run())["done"]
+
+    asyncio.run(check())
+
+
 def test_failure_retains_completed_events_and_requires_reset(program):
     async def check():
         client = NativeClient()
@@ -175,6 +316,8 @@ def test_failure_retains_completed_events_and_requires_reset(program):
         count = len(client.calls)
         with pytest.raises(ExecutionError, match="halted"):
             await program.step_into()
+        with pytest.raises(ExecutionError, match="halted"):
+            await program.undo()
         assert len(client.calls) == count
         client.failure = None
         await program.reset()
@@ -206,6 +349,8 @@ def test_cancellation_halts_program_and_reset_recovers(program):
         await started.wait()
         with pytest.raises(RuntimeError, match="sequential"):
             await program.step_into()
+        with pytest.raises(RuntimeError, match="sequential"):
+            await program.undo()
         with pytest.raises(RuntimeError, match="current debugger operation"):
             await program.reset()
         task.cancel()
@@ -283,7 +428,24 @@ def test_incomplete_physics_is_not_reported_as_success(program, bad_state):
 def test_terminal_controls_and_artifact_hash(program):
     async def check():
         await program._load(NativeClient())
-        commands = iter(["help", "where", "s", "n", "f", "r", "c", "unknown", "q"])
+        commands = iter(
+            [
+                "help",
+                "where",
+                "u",
+                "s",
+                "n",
+                "undo",
+                "n",
+                "f",
+                "r",
+                "c",
+                "u",
+                "c",
+                "unknown",
+                "q",
+            ]
+        )
         output = []
 
         async def read():
@@ -292,6 +454,14 @@ def test_terminal_controls_and_artifact_hash(program):
         assert await terminal(program, read=read, write=output.append) == 0
         assert any("Placed 0/0" in line for line in output)
         assert any("Finished: 4 parts" in line for line in output)
+        assert "undo (u)" in output[0]
+        help_lines = output[2].splitlines()
+        assert len(help_lines) == 9
+        assert all(" - " in line for line in help_lines)
+        assert "undo (u) - Undo the last step, next, finish, or continue." in help_lines
+        assert "Nothing to undo." in output
+        assert "Undid next." in output
+        assert "Undid continue." in output
         metadata = json.loads((program.output_dir / "execution.json").read_text())
         assert (
             metadata["xml_sha256"]
@@ -414,13 +584,22 @@ def test_real_stdio_execution(tmp_path, small_library):
             source, library=small_library, shadows=[], cache=tmp_path / "cache"
         ) as program:
             assert not (await program.step_into())["enabled_ids"]
+            first = await program.step_into()
+            before = program.status
+            state = await program._call("sim_get_state")
             result = await program.run()
             assert result["done"]
             assert result["enabled_ids"] == ["0/0", "0/1/0", "1/0", "1/1/0"]
-            physics = [e["physics"] for e in result["events"] if e["kind"] == "place"]
+            physics = [
+                e["physics"] for e in first["events"] + result["events"] if e["kind"] == "place"
+            ]
             assert all(p["state_finite"] and p["duration_matches"] for p in physics)
             assert all(p["actual_duration_s"] == pytest.approx(0.1) for p in physics)
             assert physics[0]["contacts"]
+            assert (await program.undo())["undone_command"] == "continue"
+            assert program.status == before
+            assert await program._call("sim_get_state") == state
+            assert await program.run() == result
             await program.reset()
             assert not program.enabled
 
