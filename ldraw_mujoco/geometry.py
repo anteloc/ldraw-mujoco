@@ -48,7 +48,7 @@ def inverted_pieces(objects):
 class Document:
     """MPD namespace and local dependencies, with .dat files as physical leaves."""
 
-    def __init__(self, path, parts=None, sections=None):
+    def __init__(self, path, parts=None, sections=None, placement_overrides=None):
         self.path = Path(path).resolve()
         if self.path.suffix.casefold() not in {".mpd", ".ldr", ".dat"}:
             raise ValueError("Input must be an .mpd, .ldr or .dat file")
@@ -56,6 +56,8 @@ class Document:
         self.models = {}
         self.origins = {}
         self.files = set()
+        self.source_lines = {}
+        self.placement_overrides = dict(placement_overrides or {})
         self.inverted = set()
         self.root = self._read(self.path)
         self._discover(self.root, set())
@@ -88,6 +90,9 @@ class Document:
         }
         self.piece_indices = {}
         self._index(self.view, "root", ())
+        for ident in self.placement_overrides:
+            if ident not in self.instances or self.instances[ident]["kind"] != "part":
+                raise ValueError(f"Edit requires a physical part occurrence ID: {ident!r}")
         self.selected_ids = self._select(sections)
 
     def _index(self, model, parent, visiting):
@@ -99,14 +104,17 @@ class Document:
             self.piece_indices[id(piece)] = index
             instance_id = str(index) if parent == "root" else f"{parent}/{index}"
             child = self.view.submodels.get(normalized(piece.reference))
+            source = self.path if model is self.view else self.origins[id(model)]
+            line = model.source_line_for(piece)
             self.instances[instance_id] = {
                 "id": instance_id,
                 "parent_id": parent,
                 "kind": "submodel" if child is not None else "part",
                 "reference": piece.reference,
                 "section": self.root.name if model is self.view else model.name,
-                "source_file": str(self.path if model is self.view else self.origins[id(model)]),
-                "line": model.source_line_for(piece),
+                "source_file": str(source),
+                "line": line,
+                "source_text": self.source_lines[source][line - 1] if line else str(piece),
             }
             if child is not None:
                 self._index(child, instance_id, (*visiting, key))
@@ -198,6 +206,7 @@ class Document:
         except PartError as exc:
             raise ValueError(f"Cannot parse {path}: {exc}") from exc
         self.files.add(path)
+        self.source_lines[path] = path.read_text(encoding="utf-8-sig").splitlines()
         for model in (root, *root.submodels.values()):
             self._register(model.name, model, path)
             # Reference ownership must survive filtering selected occurrences.
@@ -249,9 +258,59 @@ class Document:
                     f"Inline faces in assembly {model.name}; place them in a .dat section"
                 )
         try:
-            return [o for o in self.view.iter_occurrences() if self.included(self.occurrence_id(o))]
+            return [
+                self._edited_occurrence(o)
+                if self.occurrence_id(o) in self.placement_overrides
+                else o
+                for o in self.view.iter_occurrences()
+                if self.included(self.occurrence_id(o))
+            ]
         except PartError as exc:
             raise ValueError(f"Cannot expand {self.path}: {exc}") from exc
+
+    def _edited_occurrence(self, occurrence):
+        """Expand a private path through pyldraw3; repeated source instances stay untouched."""
+        from .editing import validate_placement
+
+        ident = self.occurrence_id(occurrence)
+        line = self.placement_overrides[ident]
+        piece = validate_placement(line)
+        # A short private model chain lets pyldraw3 compose all ancestor affine
+        # transforms and inherited colours, without mutating the source graph.
+        root = current = Model(name="edit-root.ldr")
+        for index, item in enumerate(occurrence.path[:-1]):
+            name = f"edit-ancestor-{index}.ldr"
+            child = Model(name=name)
+            current.objects = [
+                Piece.place(
+                    name,
+                    colour=item.piece.colour,
+                    position=item.piece.position,
+                    matrix=item.piece.matrix,
+                )
+            ]
+            root.submodels[normalized(name)] = child
+            current = child
+        current.objects = [piece]
+        expanded = next(root.iter_occurrences())
+        original = occurrence.path[-1]
+        self.piece_indices[id(piece)] = self.piece_indices[id(original.piece)]
+        if id(original.piece) in self.inverted:
+            self.inverted.add(id(piece))
+        # Resolve a newly selected local DAT through the same discovery path.
+        self.origins[id(current)] = self.origins.get(id(original.model), self.path)
+        self._discover(current, set())
+        self.instances[ident].update(reference=piece.reference, source_text=line)
+        return replace(
+            occurrence,
+            piece=piece,
+            part_code=piece.part,
+            reference=piece.reference,
+            colour=expanded.colour,
+            position=expanded.position,
+            matrix=expanded.matrix,
+            path=(*occurrence.path[:-1], replace(original, piece=piece)),
+        )
 
 
 @dataclass

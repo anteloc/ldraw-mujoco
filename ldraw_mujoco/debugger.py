@@ -3,19 +3,21 @@
 import json
 import sys
 
+from .editing import edit_placement
 from .interpreter import ExecutionError, Interpreter
 from .mcp import MCPError
 
 COMMANDS = (
     "step (s), next (n), undo (u), finish (f), continue (c), "
-    "inspect (i), where (w), reset (r), help (h), quit (q)"
+    "inspect (i), edit (e) <part id>, where (w), reset (r), help (h), quit (q)"
 )
 HELP = """step (s) - Execute one instruction, entering submodels.
 next (n) - Execute the next instruction, completing submodel calls.
-undo (u) - Undo the last step, next, finish, or continue.
+undo (u) - Undo the last execution command or edit.
 finish (f) - Finish the current submodel; at root, finish the program.
 continue (c) - Execute the rest of the program.
 inspect (i) - Show current physics as JSON, with part IDs.
+edit (e) <part id> - Edit one occurrence's type-1 placement line for this session.
 where (w) - Show the call stack and next instruction.
 reset (r) - Disable all parts, rewind, and clear undo history.
 help (h) - Show this command list.
@@ -32,7 +34,7 @@ def describe(status):
     )
 
 
-async def terminal(program, *, read=None, write=print):
+async def terminal(program, *, read=None, write=print, edit_prompt=None):
     """Return an exit status; injected text I/O also allows scripted sessions."""
     if read is None:
         if sys.stdin.isatty():
@@ -64,7 +66,9 @@ async def terminal(program, *, read=None, write=print):
     write(describe(program.status))
     while True:
         try:
-            command = (await read()).strip().lower()
+            entered = (await read()).strip().split(maxsplit=1)
+            command = entered[0].lower() if entered else ""
+            argument = entered[1] if len(entered) > 1 else ""
         except EOFError:
             return int(program.failed)
         if command in {"quit", "q"}:
@@ -78,6 +82,19 @@ async def terminal(program, *, read=None, write=print):
                 write(json.dumps(await program.inspect(), indent=2, allow_nan=False))
             except (ExecutionError, MCPError) as exc:
                 write(json.dumps({"kind": "inspect", "error": str(exc), "failed": program.failed}))
+        elif command in {"edit", "e"}:
+            if not argument:
+                write("Usage: edit (e) <part id>")
+                continue
+            try:
+                result = await edit_placement(program, argument, prompt=edit_prompt, write=write)
+                if result is not None:
+                    write(f"Edited {argument}." if result["changed"] else "Line unchanged.")
+                    if program.viewer_error:
+                        write(f"Viewer unavailable: {program.viewer_error}")
+                    write(describe(result))
+            except (ValueError, ExecutionError, MCPError) as exc:
+                write(f"Edit not applied: {exc}")
         elif command in methods:
             try:
                 result = await methods[command]()

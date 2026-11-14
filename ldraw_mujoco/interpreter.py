@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import math
+import shutil
 from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import uuid4
@@ -13,7 +14,8 @@ from uuid import uuid4
 import mujoco
 import numpy as np
 
-from .importer import import_ldraw
+from .editing import EditError, field_spans, validate_placement
+from .importer import ImportedModel, import_ldraw
 from .mcp import MCPError, MujocoClient
 
 
@@ -103,6 +105,16 @@ class Interpreter:
             self.inactive.extend(inactive)
         self.model_dimensions = {k: int(getattr(model, k)) for k in ("nq", "nv", "nbody")}
         self.slot = "ldraw-" + uuid4().hex
+        self._spare_slot = self.slot + "-edit"
+        options = self.report["options"]
+        self._import_options = {
+            "library": self.report["library"],
+            "shadows": self.report["shadows"],
+            "density": options["density_kg_m3"],
+            "friction": options["sliding_friction"],
+            "timestep": options["timestep_s"],
+            "clearance": options["ground_clearance_m"],
+        }
         self.client = None
         self.enabled = []
         self._stack = []
@@ -121,6 +133,7 @@ class Interpreter:
             "timestep_s": self.timestep,
             "reset_policy": "CAD poses and zero velocity per placement",
             "parts": self.parts,
+            "placement_overrides": self.report.get("placement_overrides", {}),
             "initial_modifications": self.inactive,
             "activation_modifications": self.activate,
             "interpretation": "Approximate rigid-body observations; caller decides placement success. "
@@ -132,7 +145,7 @@ class Interpreter:
     async def open(
         cls, path, *, seconds_per_part=0.1, output_dir=None, viewer=False, **import_options
     ):
-        """Convert once and own a stdio server until the context exits.
+        """Convert the source and own a stdio server until the context exits.
 
         Import options are those of ``import_ldraw``, except selection/grouping.
         ``output_dir`` saves the exact XML, reports and a flushed JSONL event log.
@@ -145,6 +158,13 @@ class Interpreter:
             import_ldraw(path, individual_parts=True, **import_options),
             seconds_per_part=seconds_per_part,
             output_dir=output_dir,
+        )
+        program._import_options.update(
+            {
+                k: v
+                for k, v in import_options.items()
+                if v is not None and k != "placement_overrides"
+            }
         )
         log_path = program.output_dir / "server.log" if program.output_dir else None
         async with MujocoClient.connect(log_path=log_path, viewer=viewer) as client:
@@ -173,20 +193,145 @@ class Interpreter:
         if not set(p["body"] for p in self.parts.values()) <= set(summary["bodies"]):
             raise MCPError("Loaded model is missing expected part bodies")
         if self.output_dir is not None:
-            self.output_dir.mkdir(parents=True, exist_ok=True)
-            (self.output_dir / "scene.xml").write_text(self.xml)
-            for name, payload in (
-                ("scene.import.json", self.report),
-                ("execution.json", self.preparation),
-            ):
-                (self.output_dir / name).write_text(
-                    json.dumps(payload, indent=2, allow_nan=False) + "\n"
-                )
+            self._save_scene()
             (self.output_dir / "events.jsonl").write_text("")
         self._record(
             {"kind": "load", "xml_sha256": self.preparation["xml_sha256"], "server": summary}
         )
         await self.reset()
+
+    def _save_scene(self):
+        if self.output_dir is None:
+            return
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        (self.output_dir / "scene.xml").write_text(self.xml)
+        for name, payload in (
+            ("scene.import.json", self.report),
+            ("execution.json", self.preparation),
+        ):
+            (self.output_dir / name).write_text(
+                json.dumps(payload, indent=2, allow_nan=False) + "\n"
+            )
+
+    def placement_line(self, ident):
+        """Return this occurrence's current type-1 line, including session edits."""
+        if ident not in self.parts:
+            raise ValueError(
+                f"Unknown physical part ID: {ident!r}; use where or inspect to find IDs"
+            )
+        return self.nodes[ident]["source_text"]
+
+    async def edit(self, ident, line):
+        """Replace one DAT occurrence for this session, preserving execution position."""
+        self._check_ready()
+        original = self.placement_line(ident)
+        validate_placement(line)
+        if line == original:
+            return {"events": [], **self.status, "edited_id": ident, "changed": False}
+        self._busy = True
+        try:
+            overrides = {**self.report.get("placement_overrides", {}), ident: line}
+            try:
+                imported = import_ldraw(
+                    self.report["source"],
+                    individual_parts=True,
+                    placement_overrides=overrides,
+                    **self._import_options,
+                )
+            except (ValueError, OSError) as exc:
+                field = 1 if "color" in str(exc).lower() else 14
+                start = field_spans(line)[field][0]
+                raise EditError(
+                    str(exc),
+                    column=start,
+                    field_start=start,
+                    suggestion="Check the DAT reference and placement values, then edit or cancel",
+                ) from exc
+            checkpoint = {
+                "command": "edit",
+                "edited_id": ident,
+                "stack": [frame.copy() for frame in self._stack],
+                "enabled": list(self.enabled),
+                "state": await self._call("sim_get_state") if self.enabled else None,
+                # Exact old geometry makes undo independent of subsequent source/library changes.
+                "xml": self.xml,
+                "report": self.report,
+            }
+            physics = await self._replace_scene(
+                imported, checkpoint, [*self._history, checkpoint], restore_state=False
+            )
+            self.last_result = {
+                "events": [],
+                **self.status,
+                "edited_id": ident,
+                "changed": True,
+                "source_text": line,
+                "physics": physics,
+            }
+            self._record(
+                {
+                    "kind": "edit",
+                    "before": original,
+                    "after": line,
+                    "xml_sha256": self.preparation["xml_sha256"],
+                    **self.last_result,
+                }
+            )
+            return self.last_result
+        finally:
+            self._busy = False
+
+    async def _replace_scene(self, imported, checkpoint, history, *, restore_state):
+        """Prepare in a spare MCP slot; a rejected edit leaves the current scene intact."""
+        candidate = Interpreter(imported, seconds_per_part=self.seconds_per_part)
+        if restore_state:
+            candidate.xml = checkpoint["xml"]
+            candidate.preparation["xml_sha256"] = hashlib.sha256(candidate.xml.encode()).hexdigest()
+        candidate.slot, candidate._spare_slot = self._spare_slot, self.slot
+        candidate._import_options = dict(self._import_options)
+        await candidate._load(self.client)
+        enabled = checkpoint["enabled"]
+        physics = None
+        if enabled:
+            modifications = [m for ident in enabled[:-1] for m in candidate.activate[ident]]
+            if modifications:
+                await candidate._call("modify_model", modifications=modifications)
+            candidate.enabled = list(enabled[:-1])
+            physics = await candidate._place(enabled[-1])
+            if not physics["state_finite"] or not physics["duration_matches"]:
+                raise MCPError("Edited scene produced invalid physics; the edit was not applied")
+            candidate.enabled.append(enabled[-1])
+            if restore_state:
+                state = checkpoint["state"]
+                await candidate._call("sim_set_state", qpos=state["qpos"], qvel=state["qvel"])
+                candidate._state = state
+        candidate._stack = [frame.copy() for frame in checkpoint["stack"]]
+        candidate._history = list(history)
+        candidate.output_dir = self.output_dir
+        if self.output_dir is not None:
+            archive = self.output_dir / "revisions" / self.preparation["xml_sha256"]
+            archive.mkdir(parents=True, exist_ok=True)
+            for name in ("scene.xml", "scene.import.json", "execution.json"):
+                shutil.copy2(self.output_dir / name, archive / name)
+        candidate._save_scene()
+        reopen_viewer = self._realtime
+        viewer_error = None
+        if reopen_viewer:
+            try:
+                await self._call("viewer_close")
+            except MCPError as exc:
+                viewer_error = f"Could not close the previous viewer: {exc}"
+        self.__dict__.update(candidate.__dict__)
+        self._busy = True
+        if reopen_viewer and viewer_error is None:
+            try:
+                await self.viewer()
+            except MCPError as exc:
+                viewer_error = str(exc)
+        if viewer_error:
+            self.viewer_error = viewer_error
+            self._record({"kind": "viewer_unavailable", "error": viewer_error})
+        return physics
 
     def _record(self, event):
         if self.output_dir is not None:
@@ -257,7 +402,7 @@ class Interpreter:
             )
 
     async def undo(self):
-        """Undo one successful execution command; reset clears this session's history."""
+        """Undo one execution command or edit; reset clears this session's history."""
         self._check_ready()
         if not self._history:
             self.last_result = {"events": [], **self.status, "undone_command": None}
@@ -265,7 +410,14 @@ class Interpreter:
         checkpoint = self._history[-1]
         self._busy = True
         try:
-            if checkpoint["enabled"] != self.enabled:
+            if checkpoint["command"] == "edit":
+                imported = ImportedModel(
+                    mujoco.MjSpec.from_string(checkpoint["xml"]), checkpoint["report"]
+                )
+                await self._replace_scene(
+                    imported, checkpoint, self._history[:-1], restore_state=True
+                )
+            elif checkpoint["enabled"] != self.enabled:
                 modifications = list(self.inactive)
                 for ident in checkpoint["enabled"]:
                     modifications.extend(self.activate[ident])
@@ -286,11 +438,13 @@ class Interpreter:
             self.enabled = checkpoint["enabled"]
             self._stack = checkpoint["stack"]
             self._state = checkpoint["state"]
-            self._history.pop()
+            if checkpoint["command"] != "edit":
+                self._history.pop()
             self.last_result = {
                 "events": [],
                 **self.status,
                 "undone_command": checkpoint["command"],
+                "xml_sha256": self.preparation["xml_sha256"],
             }
             self._record({"kind": "undo", **self.last_result})
             return self.last_result

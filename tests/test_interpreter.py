@@ -617,9 +617,9 @@ def test_terminal_controls_and_artifact_hash(program):
         assert any("Finished: 4 parts" in line for line in output)
         assert "undo (u)" in output[0]
         help_lines = output[2].splitlines()
-        assert len(help_lines) == 10
+        assert len(help_lines) == 11
         assert all(" - " in line for line in help_lines)
-        assert "undo (u) - Undo the last step, next, finish, or continue." in help_lines
+        assert "undo (u) - Undo the last execution command or edit." in help_lines
         assert "Nothing to undo." in output
         assert "Undid next." in output
         assert "Undid continue." in output

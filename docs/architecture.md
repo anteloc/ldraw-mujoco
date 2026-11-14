@@ -190,7 +190,7 @@ instruction executor and produce ordered call/placement events. Call events
 have no physics observation or source-language return value. Completed programs
 allow harmless further stepping.
 
-`undo()` / `undo (u)` undoes one successful step/next/finish/continue
+`undo()` / `undo (u)` undoes one successful step/next/finish/continue or edit
 command, including the entire work of a compound command. Before execution,
 save a copy of the stack and enabled IDs plus the most recent MCP state response.
 Successful commands with events enter the session's undo history; empty completed
@@ -198,12 +198,42 @@ operations do not. Undo restores original visibility, gravity compensation and
 body/geom contact masks for that enabled set, then uses `sim_set_state` to restore
 saved poses and velocities. Every completed trial has the same duration, so its
 time is preserved and checked. Undoing all placements uses `sim_reset` to return
-to time zero. Undoing a call alone requires no MCP updates. No physics steps run.
+to time zero. Undoing a call alone requires no MCP updates. Undoing execution
+commands runs no physics steps; undoing edits rebuilds the old scene as below.
 The server recomputes contacts and refreshes the viewer. Solver caches and contact
 forces are not checkpointed; the next placement still resets to CAD before its
 trial. Reset clears history, and undo failures/cancellation halt execution until
 reset. The append-only event log includes `undo` records rather than erasing
 the commands they undo. Persistent sessions and redo are not implemented.
+
+`edit <part id>` stages a full placement line using prompt_toolkit. Its leading
+`1` is a non-editable prompt. Tab/Shift+Tab navigate field spans; filename spaces
+belong to the final field. Field-level UI validation supplies caret offsets and
+repair suggestions, while pyldraw3's `parse_ldraw_line` parses the actual record.
+Syntax errors retain the draft and return focus to the first failing field after
+the user chooses to correct it. Cancelling discards only the current draft.
+
+The importer accepts `placement_overrides`, mapping physical occurrence IDs to
+replacement type-1 lines. It expands a private chain of the occurrence's ancestor
+placements through pyldraw3, preserving inherited colours, affine transforms,
+source provenance and BFC ownership. It never mutates a shared source submodel or
+writes the source files. Overrides remain DAT leaves, so part IDs and call frames
+stay valid. Inventories include `source_text`, showing the effective line for
+each occurrence. Source/dependency hashes remain hashes of the original files;
+reports retain the overrides and the execution XML hash scopes the edited scene.
+
+An accepted edit prepares the full scene in a spare MCP slot, reapplies the
+enabled set, and evaluates one CAD trial. The current scene is replaced only
+after preparation succeeds. Two slot names alternate, bounding server model
+storage even after repeated edits. The viewer is reopened after replacement;
+rendering failures do not prevent terminal execution. Edits checkpoint the exact
+previous XML, report, line overrides, call stack, enabled IDs and live state.
+Undo rebuilds from that saved XML and restores the saved poses/velocities after
+initializing the trial's time. It removes the checkpoint without creating a new
+edit, stopping at the original source revision when all edits have been undone.
+Reset clears all undo history but keeps current overrides. Old scene/report
+artifacts are retained in `revisions/<xml hash>/`; the existing event log appends
+edit/undo records instead of being reset when a scene changes.
 
 `inspect()` / `inspect (i)` uses the same observation helper as placements:
 `sim_forward` refreshes derived quantities without stepping, `sim_get_state`
@@ -280,7 +310,7 @@ The XML represents the complete collision-capable scene: replay its recorded
 initialization to reproduce the empty interpreter state. Reset events separate
 runs within one log; a fresh session replaces artifacts in its output directory.
 
-`examples/execute-106-1.py` exercises a car call, a nested wheel, undo, step out and
+`examples/execute-106-1.py` exercises a car call, a nested wheel, editing, undo, step out and
 completion. It saves current physics inspections and exact remote states,
 rendering them locally without stepping when server graphics are unavailable. Continuation checks should
 include debugger/cancellation/error tests, real stdio integration, mass and mask

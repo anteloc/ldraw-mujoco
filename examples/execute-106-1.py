@@ -63,6 +63,14 @@ async def main():
         await program.step_over()  # Wheel call, including both contained DATs.
         await capture(program, "nested-wheel")
         await capture(program, "wheel-detail", selection=["0/19/0", "0/19/1"])
+        original_line = program.placement_line("0/19/0")
+        fields = original_line.split(maxsplit=14)
+        fields[2] = str(float(fields[2]) + 20)  # Shift this wheel part by 20 local LDU.
+        await program.edit("0/19/0", " ".join(fields))
+        await capture(program, "edited-wheel")
+        await program.undo()  # Restore the original line, geometry and simulation state.
+        assert program.placement_line("0/19/0") == original_line
+        await capture(program, "edit-undone")
         await program.undo()  # Undo that whole call, including both parts.
         assert program.status["next_instruction"]["id"] == "0/19"
         assert not {"0/19/0", "0/19/1"} & set(program.enabled)

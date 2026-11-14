@@ -151,10 +151,11 @@ process connected to an assistant. Ordinary import/conversion needs no extra.
 |---|---|---|
 | `step` / `s` | `step_into()` | Execute a DAT placement or enter a submodel. |
 | `next` / `n` | `step_over()` | Execute a DAT placement or an entire submodel call. |
-| `undo` / `u` | `undo()` | Undo the last step, next, finish, or continue. |
+| `undo` / `u` | `undo()` | Undo the last execution command or edit. |
 | `finish` / `f` | `step_out()` | Finish the current submodel; at root, finish the program. |
 | `continue` / `c` | `run()` | Finish the program. |
 | `inspect` / `i` | `inspect()` | Return current physics as JSON, with part IDs. |
+| `edit` / `e` `<part id>` | `edit(id, line)` | Edit one occurrence's type-1 line for this session. |
 | `where` / `w` | `status` property | Show the stack and next instruction. |
 | `reset` / `r` | `reset()` | Disable all parts, rewind, and clear undo history. |
 | `help` / `h` | — | Show each command with a brief explanation. |
@@ -165,7 +166,7 @@ parts return to their original CAD poses with zero velocity**. Physics then
 runs for 100 ms, rounded up to whole timesteps. Change this with
 `--seconds-per-part` or `seconds_per_part=`. Each trial starts at time zero;
 motion from the previous evaluation is not carried into the next placement.
-The full input's common ground offset remains fixed throughout execution.
+The full input's common ground offset remains fixed until an edit rebuilds the scene.
 
 Entering a submodel changes only the call stack. Returning is implicit, with
 no subroutine return value. Step over/out still evaluate every contained DAT
@@ -178,6 +179,33 @@ completion. It does not run physics backward or advance time. `help`, `where`
 and `inspect` do not affect history; `reset` clears it. With no history, `u` does nothing.
 You can execute forward again after undoing. History lasts only for this session;
 execution failures still require `reset` or reopening.
+
+Use `edit 0/19/0` (or `e 0/19/0`) to edit a physical DAT placement. The full line
+is prefilled; the leading `1` is fixed. Tab and Shift+Tab move between colour,
+coordinates, the nine transform entries, and the filename. Enter applies the
+line; Esc or Ctrl+C cancels the draft. Coordinates and matrix entries must be
+finite floats. Colour accepts integer codes or LDraw direct colours, and the
+reference must resolve to a DAT part. Filenames containing spaces remain one
+field. A rejected value gets a caret under the offending character, a brief
+explanation and a suggested fix. Choose `e` to return to its field or `c` to
+cancel and restore the line as it was before this edit.
+
+Edits affect **only that occurrence**, even inside a repeated submodel. Original
+files and libraries stay unchanged. The importer rebuilds the scene and evaluates
+the currently enabled parts from their new CAD poses, keeping the instruction
+pointer and enabled IDs. The viewer reopens on the rebuilt scene. Rejected edits
+leave the current scene intact. `undo` restores the previous line, geometry and
+poses/velocities. Consecutive edits undo back to the original unedited line;
+undoing does not add another edit. Execution commands and edits share one history,
+so intervening execution commands undo first. Reset keeps session edits but
+clears undo history. Reopening starts from the source files again.
+
+For callers, `program.placement_line(id)` returns the current full line and
+`await program.edit(id, line)` applies a validated replacement. Session overrides
+are retained in the import/preparation reports. Earlier scene artifacts are
+archived under `output/…/revisions/<xml hash>/`; the event log records accepted
+edits and undos. Source hashes still describe the unchanged original files;
+the XML hash identifies the edited geometry.
 
 ```python
 import asyncio

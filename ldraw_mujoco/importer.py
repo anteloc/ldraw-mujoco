@@ -67,6 +67,7 @@ def import_ldraw(
     friction: float = 0.6,
     timestep: float = 0.001,
     clearance: float = 0.001,
+    placement_overrides: dict[str, str] | None = None,
 ) -> ImportedModel:
     """Import MPD/LDR/DAT geometry; all dimensions exposed here are SI units.
 
@@ -79,6 +80,8 @@ def import_ldraw(
     IDs, ancestor transforms and colors; overlapping selections form a union.
     ``shadows=[]`` disables external connector metadata. The returned spec is
     compiled once for validation and is still editable by the caller.
+    ``placement_overrides`` maps physical occurrence IDs to replacement type-1
+    lines. It changes only those occurrences, leaving source files unchanged.
     """
     path = Path(path).resolve()
     if not isinstance(individual_parts, bool):
@@ -92,7 +95,7 @@ def import_ldraw(
         if not np.isfinite(value) or value < 0 or (key in {"density", "timestep"} and value == 0):
             raise ValueError(f"Invalid {key}: {value}")
     parts, library_root, shadow_paths = load_library(library, shadows, cache)
-    document = Document(path, parts, sections=sections)
+    document = Document(path, parts, sections=sections, placement_overrides=placement_overrides)
     occurrences = document.occurrences()
     if not occurrences:
         raise ValueError(f"No physical part occurrences in {path}")
@@ -306,6 +309,7 @@ def import_ldraw(
     report = {
         "source": str(path),
         "source_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "placement_overrides": document.placement_overrides,
         "geometry_dependencies": {
             str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(document.files)
         },
