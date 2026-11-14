@@ -205,6 +205,20 @@ trial. Reset clears history, and undo failures/cancellation halt execution until
 reset. The append-only event log includes `undo` records rather than erasing
 the commands they undo. Persistent sessions and redo are not implemented.
 
+`inspect()` / `inspect (i)` uses the same observation helper as placements:
+`sim_forward` refreshes derived quantities without stepping, `sim_get_state`
+reads current poses/velocities/time, and `analyze_contacts` requests the full
+reported contact count. Dimension and contact-count checks reject incomplete
+responses. Every reported body has an occurrence `id`, and every contact maps
+both geoms to occurrence IDs (`null` for ground); unknown geoms are rejected.
+Inspection reports live state rather than the last placement's cached trial.
+It returns JSON-ready data with the XML hash, SI units, contact-force frame and
+debugger status, and logs a separate `inspect` record. It does not update the
+undo history, instruction pointer, cached trial state or `last_result`. Query
+errors/cancellation release the busy guard without halting execution. Inspection
+of an already halted program requires reset, since partially applied changes
+may disagree with the interpreter's enabled-part list.
+
 The execution XML retains every mesh and free body. Before exporting it, set
 gravity compensation on every part so MuJoCo initializes its compensation
 bookkeeping at compilation. Keep collision masks enabled during compilation
@@ -266,9 +280,9 @@ The XML represents the complete collision-capable scene: replay its recorded
 initialization to reproduce the empty interpreter state. Reset events separate
 runs within one log; a fresh session replaces artifacts in its output directory.
 
-`examples/execute-106-1.py` exercises a car call, a nested wheel, step out and
-completion. It saves exact remote states and renders them locally without
-stepping when server graphics are unavailable. Continuation checks should
+`examples/execute-106-1.py` exercises a car call, a nested wheel, undo, step out and
+completion. It saves current physics inspections and exact remote states,
+rendering them locally without stepping when server graphics are unavailable. Continuation checks should
 include debugger/cancellation/error tests, real stdio integration, mass and mask
 invariants, reset-before-each-placement behavior, and whole/affected-assembly
 images. To run the complete test suite with the transport installed, use

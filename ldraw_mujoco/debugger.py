@@ -8,13 +8,14 @@ from .mcp import MCPError
 
 COMMANDS = (
     "step (s), next (n), undo (u), finish (f), continue (c), "
-    "where (w), reset (r), help (h), quit (q)"
+    "inspect (i), where (w), reset (r), help (h), quit (q)"
 )
 HELP = """step (s) - Execute one instruction, entering submodels.
 next (n) - Execute the next instruction, completing submodel calls.
 undo (u) - Undo the last step, next, finish, or continue.
 finish (f) - Finish the current submodel; at root, finish the program.
 continue (c) - Execute the rest of the program.
+inspect (i) - Show current physics as JSON, with part IDs.
 where (w) - Show the call stack and next instruction.
 reset (r) - Disable all parts, rewind, and clear undo history.
 help (h) - Show this command list.
@@ -72,6 +73,11 @@ async def terminal(program, *, read=None, write=print):
             write(HELP)
         elif command in {"where", "w"}:
             write(json.dumps(program.status, indent=2))
+        elif command in {"inspect", "i"}:
+            try:
+                write(json.dumps(await program.inspect(), indent=2, allow_nan=False))
+            except (ExecutionError, MCPError) as exc:
+                write(json.dumps({"kind": "inspect", "error": str(exc), "failed": program.failed}))
         elif command in methods:
             try:
                 result = await methods[command]()

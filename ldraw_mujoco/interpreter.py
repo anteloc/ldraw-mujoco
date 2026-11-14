@@ -319,6 +319,46 @@ class Interpreter:
             count = min(remaining, 100_000)
             await self._call("sim_step", n_steps=count, realtime=self._realtime)
             remaining -= count
+        state, physics = await self._observe([*self.enabled, ident])
+        self._state = state
+        return _json_safe(
+            {
+                **physics,
+                "requested_duration_s": self.seconds_per_part,
+                "steps": self.steps,
+                "actual_duration_s": state["time"],
+                "duration_matches": math.isclose(
+                    state["time"], self.steps * self.timestep, rel_tol=1e-9, abs_tol=1e-12
+                ),
+            }
+        )
+
+    async def inspect(self):
+        """Read current physics as JSON-ready data without stepping or changing history."""
+        self._check_ready()
+        self._busy = True
+        try:
+            state, physics = await self._observe(self.enabled)
+            result = _json_safe(
+                {
+                    "kind": "inspect",
+                    "xml_sha256": self.preparation["xml_sha256"],
+                    "time_s": state["time"],
+                    "timestep_s": self.timestep,
+                    **self.status,
+                    **physics,
+                    "units": {"length": "m", "time": "s", "angle": "rad", "force": "N"},
+                    "contact_force_frame": "contact",
+                    "interpretation": self.preparation["interpretation"],
+                }
+            )
+            self._record(result)
+            return result
+        finally:
+            self._busy = False
+
+    async def _observe(self, enabled):
+        """Refresh derived quantities, then query live poses and every contact through MCP."""
         forward = await self._call("sim_forward")
         state = await self._call("sim_get_state")
         contacts = await self._call("analyze_contacts", max_contacts=forward["n_contacts"])
@@ -333,12 +373,13 @@ class Interpreter:
         ):
             raise MCPError("Server returned unexpected state dimensions")
         bodies = []
-        for active in [*self.enabled, ident]:
+        for active in enabled:
             part = self.parts[active]
             qa, va = part["qpos_address"], part["qvel_address"]
             bodies.append(
                 {
                     "id": active,
+                    "reference": self.nodes[active]["reference"],
                     "body": part["body"],
                     "position_m": qpos[qa : qa + 3].tolist(),
                     "quaternion_wxyz": qpos[qa + 3 : qa + 7].tolist(),
@@ -349,22 +390,20 @@ class Interpreter:
                 }
             )
         for contact in contacts["contacts"]:
-            contact["part1_id"] = self.geom_ids[contact["geom1"]]
-            contact["part2_id"] = self.geom_ids[contact["geom2"]]
+            try:
+                contact["part1_id"] = self.geom_ids[contact["geom1"]]
+                contact["part2_id"] = self.geom_ids[contact["geom2"]]
+            except KeyError as exc:
+                raise MCPError(f"Server returned an unknown contact geom: {exc}") from exc
         physics = {
-            "requested_duration_s": self.seconds_per_part,
-            "steps": self.steps,
-            "actual_duration_s": state["time"],
-            "state_finite": bool(np.isfinite(qpos).all() and np.isfinite(qvel).all()),
-            "duration_matches": math.isclose(
-                state["time"], self.steps * self.timestep, rel_tol=1e-9, abs_tol=1e-12
+            "state_finite": bool(
+                math.isfinite(state["time"]) and np.isfinite(qpos).all() and np.isfinite(qvel).all()
             ),
             "bodies": bodies,
             "contacts": contacts["contacts"],
             "contact_count": contacts["n_contacts"],
         }
-        self._state = state
-        return _json_safe(physics)
+        return state, physics
 
     async def _advance(self, mode):
         self._check_ready()

@@ -154,6 +154,7 @@ process connected to an assistant. Ordinary import/conversion needs no extra.
 | `undo` / `u` | `undo()` | Undo the last step, next, finish, or continue. |
 | `finish` / `f` | `step_out()` | Finish the current submodel; at root, finish the program. |
 | `continue` / `c` | `run()` | Finish the program. |
+| `inspect` / `i` | `inspect()` | Return current physics as JSON, with part IDs. |
 | `where` / `w` | `status` property | Show the stack and next instruction. |
 | `reset` / `r` | `reset()` | Disable all parts, rewind, and clear undo history. |
 | `help` / `h` | — | Show each command with a brief explanation. |
@@ -173,13 +174,14 @@ placement and retain every observation. Empty submodels return immediately.
 `undo` restores the stack, enabled parts, poses and velocities from before
 the last execution command. For example, `next` on a submodel followed by `u`
 undoes that whole call. Repeating `u` walks further back, including after program
-completion. It does not run physics backward or advance time. `help` and `where`
-do not affect history; `reset` clears it. With no history, `u` does nothing.
+completion. It does not run physics backward or advance time. `help`, `where`
+and `inspect` do not affect history; `reset` clears it. With no history, `u` does nothing.
 You can execute forward again after undoing. History lasts only for this session;
 execution failures still require `reset` or reopening.
 
 ```python
 import asyncio
+import json
 from ldraw_mujoco import Interpreter
 
 async def main():
@@ -192,6 +194,7 @@ async def main():
         result = await program.step_over()  # Place its first DAT part.
         print(result["events"][0]["physics"])
         print(result["next_instruction"])
+        print(json.dumps(await program.inspect(), indent=2, allow_nan=False))
 
 asyncio.run(main())
 ```
@@ -204,6 +207,20 @@ complete final contacts/forces and requested/actual evaluation duration.
 Linear velocities use world coordinates; angular velocities use the body frame.
 Call events have `physics: null`. Source lines are one-based; occurrence IDs
 remain zero-based placement paths.
+
+`inspect (i)` reads the live MCP state at the current picture, including after
+undo or reset. It refreshes contacts without advancing time, placing parts, or
+changing the instruction pointer, undo history, or `last_result`. Its JSON
+contains `time_s`, `timestep_s`, `xml_sha256`, debugger status, `state_finite`,
+`bodies`, `contacts`, and `contact_count`. Each enabled body has its occurrence
+`id`, DAT `reference`, pose, velocity and displacement from CAD. Each contact has
+`part1_id` and `part2_id`; `null` identifies the ground (`geom1` or `geom2` is
+`ground`). Contact `pos` and `dist` are meters, with negative distance indicating
+penetration. `normal_force` and the two `friction_force` components are newtons
+in the contact frame. All contacts are returned. Empty scenes have empty arrays.
+Inspections are also saved as `kind: "inspect"` records in `events.jsonl`.
+A failed inspection query can be retried; an already halted execution still
+requires reset or reopening.
 
 The caller decides whether a placement succeeded. `state_finite` and
 `duration_matches` describe the final observation, not a guarantee of numerical

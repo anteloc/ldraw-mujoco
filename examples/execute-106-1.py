@@ -18,6 +18,7 @@ OUTPUT = ROOT / "output/106-1/execution"
 
 
 async def capture(program, name, *, selection=None):
+    write_json(OUTPUT / f"{name}.inspect.json", await program.inspect())
     state = await program.client.call("sim_get_state", sim_name=program.slot)
     write_json(
         OUTPUT / f"{name}.state.json",

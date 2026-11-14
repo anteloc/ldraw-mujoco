@@ -165,6 +165,162 @@ def test_activation_preserves_mass_transparency_and_resets_every_trial(program):
     asyncio.run(check())
 
 
+def test_inspect_reads_current_physics_without_changing_execution_or_history(program):
+    async def check():
+        client = NativeClient()
+        await program._load(client)
+
+        async def inspect_current(ids):
+            status, last, cached = program.status, program.last_result, program._state
+            history = list(program._history)
+            state = await client.call("sim_get_state")
+            starts = len(client.starts)
+            result = await program.inspect()
+            assert result["kind"] == "inspect"
+            assert result["enabled_ids"] == ids
+            assert result["time_s"] == state["time"]
+            assert result["xml_sha256"] == program.preparation["xml_sha256"]
+            assert result["state_finite"]
+            assert [b["id"] for b in result["bodies"]] == ids
+            for body in result["bodies"]:
+                part = program.parts[body["id"]]
+                qa, va = part["qpos_address"], part["qvel_address"]
+                assert body["reference"] == "cube.dat"
+                assert body["position_m"] == state["qpos"][qa : qa + 3]
+                assert body["quaternion_wxyz"] == state["qpos"][qa + 3 : qa + 7]
+                assert body["linear_velocity_m_s"] == state["qvel"][va : va + 3]
+                assert body["angular_velocity_rad_s"] == state["qvel"][va + 3 : va + 6]
+            assert result["contact_count"] == len(result["contacts"]) == client.data.ncon
+            for contact in result["contacts"]:
+                assert contact["part1_id"] in [None, *ids]
+                assert contact["part2_id"] in [None, *ids]
+            assert program.status == status
+            assert program.last_result is last
+            assert program._state is cached
+            assert program._history == history
+            assert len(client.starts) == starts
+            assert await client.call("sim_get_state") == state
+            json.dumps(result, allow_nan=False)
+            return result
+
+        assert not (await inspect_current([]))["contacts"]
+        await program.step_into()
+        await inspect_current([])
+        await program.step_into()
+        assert (await inspect_current(["0/0"]))["contacts"]
+        # A live state edit must appear immediately, without consulting cached trials.
+        part = program.parts["0/0"]
+        client.data.qpos[part["qpos_address"]] += 0.001
+        client.data.qvel[part["qvel_address"]] = 0.25
+        edited = await inspect_current(["0/0"])
+        assert edited["bodies"][0]["linear_velocity_m_s"][0] == 0.25
+        await program.step_over()
+        await inspect_current(["0/0", "0/1/0"])
+        await program.run()
+        assert (await inspect_current(["0/0", "0/1/0", "1/0", "1/1/0"]))["done"]
+        assert (await program.undo())["undone_command"] == "continue"
+        await inspect_current(["0/0", "0/1/0"])
+        await program.reset()
+        assert (await inspect_current([]))["time_s"] == 0
+        records = [
+            json.loads(line)
+            for line in (program.output_dir / "events.jsonl").read_text().splitlines()
+        ]
+        assert len([r for r in records if r["kind"] == "inspect"]) == 8
+
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("failure", ["query", "incomplete", "unknown_geom"])
+def test_inspect_reports_query_errors_without_losing_history(program, failure):
+    async def check():
+        client = NativeClient()
+        await program._load(client)
+        await program.step_into()
+        await program.step_into()
+        original = client.call
+        last, status = program.last_result, program.status
+
+        async def fail(tool, **args):
+            if failure == "query" and tool == "sim_get_state":
+                raise MCPError("inspection query failed")
+            result = await original(tool, **args)
+            if tool == "analyze_contacts":
+                if failure == "incomplete":
+                    result["contacts"] = []
+                if failure == "unknown_geom":
+                    result["contacts"][0]["geom1"] = "unknown"
+            return result
+
+        client.call = fail
+        with pytest.raises(MCPError):
+            await program.inspect()
+        assert program.status == status
+        assert program.last_result is last
+        client.call = original
+        assert (await program.inspect())["state_finite"]
+        assert (await program.undo())["undone_command"] == "step"
+
+    asyncio.run(check())
+
+
+def test_inspect_nonfinite_values_remain_valid_json(program):
+    async def check():
+        client = NativeClient()
+        await program._load(client)
+        await program.step_into()
+        await program.step_into()
+        original = client.call
+
+        async def nonfinite(tool, **args):
+            result = await original(tool, **args)
+            if tool == "sim_get_state":
+                result["qpos"][0] = float("nan")
+                result["time"] = float("inf")
+            if tool == "analyze_contacts":
+                result["contacts"][0]["normal_force"] = float("inf")
+            return result
+
+        client.call = nonfinite
+        result = await program.inspect()
+        assert not result["state_finite"]
+        assert result["time_s"] is None
+        assert result["bodies"][0]["position_m"][0] is None
+        assert result["contacts"][0]["normal_force"] is None
+        json.dumps(result, allow_nan=False)
+
+    asyncio.run(check())
+
+
+def test_cancelled_inspection_releases_busy_state_without_halting(program):
+    async def check():
+        client = NativeClient()
+        await program._load(client)
+        original = client.call
+        started = asyncio.Event()
+
+        async def blocked(tool, **args):
+            if tool == "sim_get_state":
+                started.set()
+                await asyncio.Event().wait()
+            return await original(tool, **args)
+
+        client.call = blocked
+        task = asyncio.create_task(program.inspect())
+        await started.wait()
+        for operation in (program.inspect, program.step_into, program.undo):
+            with pytest.raises(RuntimeError, match="sequential"):
+                await operation()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not program.failed
+        client.call = original
+        assert (await program.run())["done"]
+
+    asyncio.run(check())
+
+
 def test_undo_restores_calls_parts_empty_returns_and_completed_program(program):
     async def check():
         client = NativeClient()
@@ -317,6 +473,8 @@ def test_failure_retains_completed_events_and_requires_reset(program):
         with pytest.raises(ExecutionError, match="halted"):
             await program.step_into()
         with pytest.raises(ExecutionError, match="halted"):
+            await program.inspect()
+        with pytest.raises(ExecutionError, match="halted"):
             await program.undo()
         assert len(client.calls) == count
         client.failure = None
@@ -432,14 +590,17 @@ def test_terminal_controls_and_artifact_hash(program):
             [
                 "help",
                 "where",
+                "inspect",
                 "u",
                 "s",
                 "n",
+                "i",
                 "undo",
                 "n",
                 "f",
                 "r",
                 "c",
+                "inspect",
                 "u",
                 "c",
                 "unknown",
@@ -456,12 +617,20 @@ def test_terminal_controls_and_artifact_hash(program):
         assert any("Finished: 4 parts" in line for line in output)
         assert "undo (u)" in output[0]
         help_lines = output[2].splitlines()
-        assert len(help_lines) == 9
+        assert len(help_lines) == 10
         assert all(" - " in line for line in help_lines)
         assert "undo (u) - Undo the last step, next, finish, or continue." in help_lines
         assert "Nothing to undo." in output
         assert "Undid next." in output
         assert "Undid continue." in output
+        inspections = [
+            json.loads(line) for line in output if line.startswith('{\n  "kind": "inspect"')
+        ]
+        assert [i["enabled_ids"] for i in inspections] == [
+            [],
+            ["0/0"],
+            ["0/0", "0/1/0", "1/0", "1/1/0"],
+        ]
         metadata = json.loads((program.output_dir / "execution.json").read_text())
         assert (
             metadata["xml_sha256"]
@@ -583,6 +752,7 @@ def test_real_stdio_execution(tmp_path, small_library):
         async with Interpreter.open(
             source, library=small_library, shadows=[], cache=tmp_path / "cache"
         ) as program:
+            assert (await program.inspect())["time_s"] == 0
             assert not (await program.step_into())["enabled_ids"]
             first = await program.step_into()
             before = program.status
@@ -596,9 +766,17 @@ def test_real_stdio_execution(tmp_path, small_library):
             assert all(p["state_finite"] and p["duration_matches"] for p in physics)
             assert all(p["actual_duration_s"] == pytest.approx(0.1) for p in physics)
             assert physics[0]["contacts"]
+            inspection = await program.inspect()
+            assert inspection["enabled_ids"] == result["enabled_ids"]
+            assert inspection["contact_count"] == len(inspection["contacts"])
+            for contact in inspection["contacts"]:
+                assert "normal_force" in contact and "friction_force" in contact
+                assert contact["part1_id"] in [None, *program.enabled]
+                assert contact["part2_id"] in [None, *program.enabled]
             assert (await program.undo())["undone_command"] == "continue"
             assert program.status == before
             assert await program._call("sim_get_state") == state
+            assert (await program.inspect())["enabled_ids"] == before["enabled_ids"]
             assert await program.run() == result
             await program.reset()
             assert not program.enabled
