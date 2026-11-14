@@ -137,6 +137,9 @@ and full-input IDs; a DAT's internal primitives are never instructions.
 ```sh
 uv sync --locked --extra interpreter
 uv run --extra interpreter ldraw-mujoco execute data/models-annotated/106-1.mpd
+
+# Open the native MuJoCo window and watch each placement's physics.
+uv run --extra interpreter ldraw-mujoco execute data/models-annotated/106-1.mpd --viewer
 ```
 
 The interpreter starts its own stdio MuJoCo MCP process from the installed
@@ -173,6 +176,7 @@ async def main():
     async with Interpreter.open(
         "data/models-annotated/106-1.mpd",
         output_dir="output/106-1/python-execution",
+        viewer=True,  # Optional native window with paced physics playback.
     ) as program:
         await program.step_into()  # Enter the car submodel.
         result = await program.step_over()  # Place its first DAT part.
@@ -217,9 +221,21 @@ artifacts in its output directory; use distinct directories to retain runs.
 
 `--library`, `--shadow` / `--no-shadow`, `--density`, `--friction`, `--timestep`
 and `--clearance` configure import. Execution always covers the full input in
-individual-parts mode. Add `--viewer` to request the server's live viewer;
-unavailable graphics leave terminal execution available. The current server's
-viewer is display-dependent, including limitations on macOS.
+individual-parts mode. With `--viewer`, each trial plays at approximately real
+time, with viewer updates around 60 times per simulated second. The window
+shows the MCP process's actual model and state: CAD reset, new part placement,
+physics motion, then a pause awaiting the next debugger command. Continue and
+step over/out also show the contained placements. Physics timesteps and trial
+durations are unchanged. The terminal remains the execution controller; use
+the native viewer to rotate, pan and zoom the scene.
+
+The interpreter selects `mjpython` automatically on macOS and handles uv's
+Python library path. Linux and Windows use the ordinary server launcher.
+Closing the window leaves the interpreter usable and removes playback pacing.
+`await program.viewer()` reopens it; on macOS, open the interpreter with
+`viewer=True` so its server has the native launcher. A window-launch failure is
+available as `program.viewer_error`, and the CLI reports it while keeping
+terminal execution available. A local desktop is required for the live window.
 
 ```sh
 # Script a debugger session, or type these commands interactively.

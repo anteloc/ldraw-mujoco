@@ -109,6 +109,8 @@ class Interpreter:
         self.failed = False
         self.last_result = None
         self._busy = False
+        self._realtime = False
+        self.viewer_error = None
         self.output_dir = Path(output_dir) if output_dir is not None else None
         self.preparation = {
             "xml_sha256": hashlib.sha256(self.xml.encode()).hexdigest(),
@@ -125,11 +127,15 @@ class Interpreter:
 
     @classmethod
     @asynccontextmanager
-    async def open(cls, path, *, seconds_per_part=0.1, output_dir=None, **import_options):
+    async def open(
+        cls, path, *, seconds_per_part=0.1, output_dir=None, viewer=False, **import_options
+    ):
         """Convert once and own a stdio server until the context exits.
 
         Import options are those of ``import_ldraw``, except selection/grouping.
         ``output_dir`` saves the exact XML, reports and a flushed JSONL event log.
+        ``viewer=True`` opens a native viewer and paces playback to real time.
+        A failed window launch is recorded in ``viewer_error``; execution remains available.
         """
         if {"sections", "individual_parts"} & import_options.keys():
             raise ValueError("The interpreter always executes the full input as individual parts")
@@ -139,9 +145,15 @@ class Interpreter:
             output_dir=output_dir,
         )
         log_path = program.output_dir / "server.log" if program.output_dir else None
-        async with MujocoClient.connect(log_path=log_path) as client:
+        async with MujocoClient.connect(log_path=log_path, viewer=viewer) as client:
             await program._load(client)
             try:
+                if viewer:
+                    try:
+                        await program.viewer()
+                    except MCPError as exc:
+                        program.viewer_error = str(exc)
+                        program._record({"kind": "viewer_unavailable", "error": str(exc)})
                 yield program
             finally:
                 program.client = None
@@ -225,8 +237,12 @@ class Interpreter:
             self._busy = False
 
     async def viewer(self):
-        """Ask the server to open its optional live viewer."""
-        return await self._call("viewer_open")
+        """Open/reopen the live viewer; on macOS use open(viewer=True) to select mjpython."""
+        result = await self._call("viewer_open")
+        self._realtime = True
+        self.viewer_error = None
+        self._record({"kind": "viewer_open", "realtime": True})
+        return result
 
     async def _place(self, ident):
         await self._call("sim_reset")
@@ -234,7 +250,7 @@ class Interpreter:
         remaining = self.steps
         while remaining:
             count = min(remaining, 100_000)
-            await self._call("sim_step", n_steps=count)
+            await self._call("sim_step", n_steps=count, realtime=self._realtime)
             remaining -= count
         forward = await self._call("sim_forward")
         state = await self._call("sim_get_state")

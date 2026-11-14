@@ -25,7 +25,7 @@ ldraw-mujoco = "ldraw_mujoco.cli:main"
 interpreter = [
     "mcp==1.26.0",
     "prompt-toolkit>=3.0,<4",
-    "mujoco-mcp-server @ git+https://github.com/anteloc/mujoco-mcp-server.git@ce9bed80ec3698d7b778230abc21f2228a3ce94b",
+    "mujoco-mcp-server @ git+https://github.com/anteloc/mujoco-mcp-server.git@3e249d3834322c49bf611e48903dd54871823de8",
 ]
 
 [dependency-groups]

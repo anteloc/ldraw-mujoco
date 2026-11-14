@@ -89,10 +89,11 @@ async def execute(args):
         friction=args.friction,
         timestep=args.timestep,
         clearance=args.clearance,
+        viewer=args.viewer,
     ) as program:
-        if args.viewer:
-            try:
-                await program.viewer()
-            except MCPError as exc:
-                print(f"Viewer unavailable; terminal execution is ready: {exc}", file=sys.stderr)
+        if program.viewer_error:
+            print(
+                f"Viewer unavailable; terminal execution is ready: {program.viewer_error}",
+                file=sys.stderr,
+            )
         return await terminal(program)

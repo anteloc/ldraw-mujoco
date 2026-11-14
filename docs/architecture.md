@@ -170,7 +170,7 @@ articulated mechanisms remain deferred until explicitly requested.
 
 `Interpreter.open()` imports the full input with `individual_parts=True` and
 owns a stdio MCP process for its lifetime. The optional `interpreter` extra pins
-the server to `ce9bed80ec3698d7b778230abc21f2228a3ce94b`, the MCP SDK to 1.26.0,
+the server to `3e249d3834322c49bf611e48903dd54871823de8`, the MCP SDK to 1.26.0,
 and retains MuJoCo 3.5.0. The executable comes from the project environment;
 editable server installations are rejected. No neighboring checkout is imported
 or launched. Existing conversion and local simulation APIs remain independent.
@@ -227,7 +227,23 @@ Cancellation also marks execution halted. Concurrent debugger operations are
 rejected. Exiting the context closes the owned process and its viewer.
 
 The CLI provides the debugger commands and optional server viewer. Headless
-operation is fully supported. Interactive input uses prompt_toolkit's async
+operation is fully supported. `Interpreter.open(viewer=True)` selects MuJoCo's
+`mjpython -m mujoco_mcp` launcher on macOS. Its environment includes the base
+Python `LIBDIR` in `DYLD_FALLBACK_LIBRARY_PATH`, avoiding uv virtual-environment
+symlink resolution failures. Other platforms and ordinary headless sessions
+use the installed `mujoco-mcp` entrypoint. The pinned server detects native
+CGL/GLFW instead of requiring Linux display variables on macOS/Windows.
+
+Opening the viewer enables `sim_step(realtime=True)`. The server synchronizes
+the actual slot's model/data approximately every 1/60 simulated second and
+sleeps only as needed to pace playback while the window is open. It preserves
+the requested number of physics steps and their timestep. Closing the viewer
+lets the same simulation finish without pacing. Reopening restores paced
+playback. The CAD reset between placements is visible; no alternate simulation
+or trajectory playback is involved. Window-launch errors are recorded in
+`viewer_error` and the event log. Startup errors include the server log tail.
+
+Interactive input uses prompt_toolkit's async
 prompt so Ctrl+C can exit without a blocked input thread. Server stderr is
 captured separately in `server.log`. Artifacts include the exact loaded XML and hash,
 import evidence, preparation/activation settings, and a flushed JSONL log.

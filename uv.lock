@@ -814,7 +814,7 @@ dev = [
 requires-dist = [
     { name = "mcp", marker = "extra == 'interpreter'", specifier = "==1.26.0" },
     { name = "mujoco", specifier = "==3.5.0" },
-    { name = "mujoco-mcp-server", marker = "extra == 'interpreter'", git = "https://github.com/anteloc/mujoco-mcp-server.git?rev=ce9bed80ec3698d7b778230abc21f2228a3ce94b" },
+    { name = "mujoco-mcp-server", marker = "extra == 'interpreter'", git = "https://github.com/anteloc/mujoco-mcp-server.git?rev=3e249d3834322c49bf611e48903dd54871823de8" },
     { name = "numpy", specifier = ">=2.2,<3" },
     { name = "pillow", specifier = ">=11,<13" },
     { name = "prompt-toolkit", marker = "extra == 'interpreter'", specifier = ">=3.0,<4" },
@@ -944,7 +944,7 @@ wheels = [
 [[package]]
 name = "mujoco-mcp-server"
 version = "0.2.0"
-source = { git = "https://github.com/anteloc/mujoco-mcp-server.git?rev=ce9bed80ec3698d7b778230abc21f2228a3ce94b#ce9bed80ec3698d7b778230abc21f2228a3ce94b" }
+source = { git = "https://github.com/anteloc/mujoco-mcp-server.git?rev=3e249d3834322c49bf611e48903dd54871823de8#3e249d3834322c49bf611e48903dd54871823de8" }
 dependencies = [
     { name = "gymnasium" },
     { name = "matplotlib" },

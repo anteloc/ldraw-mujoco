@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import importlib.util
 import json
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import mujoco
@@ -10,7 +11,7 @@ import pytest
 
 from ldraw_mujoco import ExecutionError, Interpreter, inspect_ldraw
 from ldraw_mujoco.debugger import terminal
-from ldraw_mujoco.mcp import MCPError, decode_result
+from ldraw_mujoco.mcp import MCPError, MujocoClient, decode_result, server_command
 from ldraw_mujoco.simulation import contacts
 
 IDENTITY = "1 0 0 0 1 0 0 0 1"
@@ -343,6 +344,61 @@ def test_duration_validation_and_rounding(build):
         with pytest.raises(ValueError, match="positive"):
             Interpreter(imported, seconds_per_part=duration)
     assert Interpreter(imported, seconds_per_part=0.0011).steps == 2
+
+
+@pytest.mark.parametrize(
+    "platform, graphical, executable, arguments",
+    [
+        ("darwin", True, "mjpython", ["-m", "mujoco_mcp"]),
+        ("darwin", False, "mujoco-mcp", []),
+        ("linux", True, "mujoco-mcp", []),
+    ],
+)
+def test_viewer_launcher_uses_installed_environment(
+    monkeypatch, tmp_path, platform, graphical, executable, arguments
+):
+    import ldraw_mujoco.mcp as adapter
+
+    monkeypatch.setattr(adapter.sys, "platform", platform)
+    monkeypatch.setattr(adapter.sysconfig, "get_path", lambda _: str(tmp_path))
+    (tmp_path / executable).touch()
+    assert server_command(viewer=graphical) == (str(tmp_path / executable), arguments)
+
+
+@pytest.mark.parametrize("available", [True, False])
+def test_viewer_option_paces_success_and_preserves_headless_fallback(
+    monkeypatch, tmp_path, small_library, available
+):
+    client = NativeClient()
+    original = client.call
+
+    async def call(tool, **args):
+        if available and tool == "viewer_open":
+            return {"ok": True}
+        return await original(tool, **args)
+
+    client.call = call
+
+    @asynccontextmanager
+    async def connect(**kwargs):
+        assert kwargs["viewer"] is True
+        yield client
+
+    monkeypatch.setattr(MujocoClient, "connect", connect)
+    source = tmp_path / "viewer.mpd"
+    source.write_text(PROGRAM)
+
+    async def check():
+        async with Interpreter.open(
+            source, library=small_library, shadows=[], cache=tmp_path / "cache", viewer=True
+        ) as program:
+            assert bool(program.viewer_error) is not available
+            assert (await program.run())["done"]
+            steps = [args for tool, args in client.calls if tool == "sim_step"]
+            assert len(steps) == 4
+            assert all(args["realtime"] is available for args in steps)
+
+    asyncio.run(check())
 
 
 @pytest.mark.integration
