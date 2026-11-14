@@ -162,9 +162,86 @@ mechanisms with body trees and equality constraints. Those mechanisms are a
 later extension. Its reflection mapping and hand-written approximate inertia
 formulas were not carried into this importer.
 
-Keep the next work focused on callers selecting IDs and choosing the single
-parts/welded flag. Mixed per-instance modes, support contexts, stability verdicts,
-attachments and articulated mechanisms are deferred until explicitly requested.
+Source execution is now a separate layer on the importer, described below.
+Mixed per-instance modes, support contexts, stability verdicts, attachments and
+articulated mechanisms remain deferred until explicitly requested.
+
+## Interpreter and MCP execution
+
+`Interpreter.open()` imports the full input with `individual_parts=True` and
+owns a stdio MCP process for its lifetime. The optional `interpreter` extra pins
+the server to `ce9bed80ec3698d7b778230abc21f2228a3ce94b`, the MCP SDK to 1.26.0,
+and retains MuJoCo 3.5.0. The executable comes from the project environment;
+editable server installations are rejected. No neighboring checkout is imported
+or launched. Existing conversion and local simulation APIs remain independent.
+
+The ordered inventory supplies instructions and their parent/child links;
+there is no new record parser or transform composer. Source-file provenance is
+included alongside section and line in inventory nodes. The interpreter keeps
+a stack of occurrence IDs and next-instruction indices. A submodel instruction
+pushes a frame, while exhausting its children implicitly returns. Repeated
+definitions have separate occurrence frames. DATs stop execution traversal.
+Empty calls produce a call event and return immediately.
+
+Step into executes one instruction. Step over finishes the next call at its
+original stack depth. Step out finishes the current frame; at root it finishes
+the program. Run executes until the stack empties. All operations use the same
+instruction executor and produce ordered call/placement events. Call events
+have no physics observation or source-language return value. Completed programs
+allow harmless further stepping. Reverse execution and persistent sessions are
+not implemented.
+
+The execution XML retains every mesh and free body. Before exporting it, set
+gravity compensation on every part so MuJoCo initializes its compensation
+bookkeeping at compilation. Keep collision masks enabled during compilation
+so collision structures are retained. After MCP loads the XML, a batch update
+hides every geom, zeros geom and body contact masks, and keeps gravity
+compensated. These inactive bodies retain mass and inertia but cannot contact
+the enabled assembly. Do not zero masses or edit free-joint topology.
+
+For each part, `sim_reset` restores all poses, velocities, warmstarts and time.
+Model-field changes survive that reset, so earlier parts stay enabled. A batch
+`modify_model` restores the new part's original RGBA and contact masks, updates
+its body's aggregate masks, and disables its compensation. Body masks must
+match the bitwise OR of their attached geom masks. Changes are followed by MCP
+`sim_step`, `sim_forward`, state queries, and an untruncated contact query.
+Time advancement occurs only in the server. This follows the runtime rules in
+[MuJoCo's model-change reference](https://mujoco.readthedocs.io/en/3.5.0/programming/simulation.html#mjmodel-changes).
+
+Each trial starts at CAD, with the accumulated enabled set, rather than carrying
+the previous trial's motion forward. The default observation window is 100 ms;
+requested duration rounds up to whole timesteps. No attachment constraints or
+success verdicts are introduced. Results expose final poses, native free-joint
+velocities, displacement, contact measurements, duration and state finiteness.
+Native angular free-joint velocities are in the body frame. Server warning
+counters and intermediate numerical checks are not exposed by the tools used
+here; final-state observations must not be described as a full numerical audit.
+Global energy would include dormant masses, so it is intentionally omitted.
+
+The MCP adapter checks required tools and MuJoCo version and decodes structured
+or textual JSON responses. Tool-level errors and individual failed modification
+entries halt execution. A partially applied update is not rolled back or
+automatically retried. The failing instruction and completed events remain in
+the exception/result/log; reset reapplies all inactive settings before rewinding.
+Cancellation also marks execution halted. Concurrent debugger operations are
+rejected. Exiting the context closes the owned process and its viewer.
+
+The CLI provides the debugger commands and optional server viewer. Headless
+operation is fully supported. Interactive input uses prompt_toolkit's async
+prompt so Ctrl+C can exit without a blocked input thread. Server stderr is
+captured separately in `server.log`. Artifacts include the exact loaded XML and hash,
+import evidence, preparation/activation settings, and a flushed JSONL log.
+The XML represents the complete collision-capable scene: replay its recorded
+initialization to reproduce the empty interpreter state. Reset events separate
+runs within one log; a fresh session replaces artifacts in its output directory.
+
+`examples/execute-106-1.py` exercises a car call, a nested wheel, step out and
+completion. It saves exact remote states and renders them locally without
+stepping when server graphics are unavailable. Continuation checks should
+include debugger/cancellation/error tests, real stdio integration, mass and mask
+invariants, reset-before-each-placement behavior, and whole/affected-assembly
+images. To run the complete test suite with the transport installed, use
+`uv run --extra interpreter pytest -q`; without the extra the real stdio test skips.
 
 The ID convention comes from Carlos Antelo's
 [ldraw-mecha](https://github.com/anteloc/ldraw-mecha) documentation (2026,

@@ -21,6 +21,13 @@ dependencies = [
 [project.scripts]
 ldraw-mujoco = "ldraw_mujoco.cli:main"
 
+[project.optional-dependencies]
+interpreter = [
+    "mcp==1.26.0",
+    "prompt-toolkit>=3.0,<4",
+    "mujoco-mcp-server @ git+https://github.com/anteloc/mujoco-mcp-server.git@ce9bed80ec3698d7b778230abc21f2228a3ce94b",
+]
+
 [dependency-groups]
 dev = ["pytest>=9,<10", "ruff>=0.14"]
 
@@ -29,7 +36,7 @@ include = ["ldraw_mujoco*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["integration: requires the local LDraw library and sample model"]
+markers = ["integration: requires local sample data or optional interpreter dependencies"]
 
 [tool.ruff]
 line-length = 100

@@ -128,6 +128,113 @@ adds part IDs, transforms and geom names; `bodies` maps each body to its owning
 `instance_id`. `selected_instances` records the resolved IDs (such as `0/46`). Names of
 bodies/geoms derive from full-input IDs, so selection does not renumber them.
 
+## Execute LDraw instructions through MCP
+
+The optional interpreter treats model/submodel references as subroutine calls
+and physical DAT references as part placements. It uses the existing parser
+and full-input IDs; a DAT's internal primitives are never instructions.
+
+```sh
+uv sync --locked --extra interpreter
+uv run --extra interpreter ldraw-mujoco execute data/models-annotated/106-1.mpd
+```
+
+The interpreter starts its own stdio MuJoCo MCP process from the installed
+project environment. The extra pins the server source revision, MCP SDK and
+MuJoCo version. It has no runtime dependency on another checkout or the MCP
+process connected to an assistant. Ordinary import/conversion needs no extra.
+
+| Terminal command | Python method | Effect |
+|---|---|---|
+| `step` / `s` | `step_into()` | Execute a DAT placement or enter a submodel. |
+| `next` / `n` | `step_over()` | Execute a DAT placement or an entire submodel call. |
+| `finish` / `f` | `step_out()` | Finish the current submodel; at root, finish the program. |
+| `continue` / `c` | `run()` | Finish the program. |
+| `where` / `w` | `status` property | Show the stack and next instruction. |
+| `reset` / `r` | `reset()` | Disable all parts and rewind. |
+| `help` / `h`, `quit` / `q` | — | Show commands or close the owned server. |
+
+Every DAT placement enables one free body. Before each evaluation, **all enabled
+parts return to their original CAD poses with zero velocity**. Physics then
+runs for 100 ms, rounded up to whole timesteps. Change this with
+`--seconds-per-part` or `seconds_per_part=`. Each trial starts at time zero;
+motion from the previous evaluation is not carried into the next placement.
+The full input's common ground offset remains fixed throughout execution.
+
+Entering a submodel changes only the call stack. Returning is implicit, with
+no subroutine return value. Step over/out still evaluate every contained DAT
+placement and retain every observation. Empty submodels return immediately.
+
+```python
+import asyncio
+from ldraw_mujoco import Interpreter
+
+async def main():
+    async with Interpreter.open(
+        "data/models-annotated/106-1.mpd",
+        output_dir="output/106-1/python-execution",
+    ) as program:
+        await program.step_into()  # Enter the car submodel.
+        result = await program.step_over()  # Place its first DAT part.
+        print(result["events"][0]["physics"])
+        print(result["next_instruction"])
+
+asyncio.run(main())
+```
+
+Results are JSON-serializable dictionaries with `events`, `stack`,
+`next_instruction`, `done`, `enabled_ids`, and `failed`. Events contain the source
+file, section, line, occurrence ID and call path. Placement observations include
+all enabled parts' positions, quaternions, velocities and CAD displacement, plus
+complete final contacts/forces and requested/actual evaluation duration.
+Linear velocities use world coordinates; angular velocities use the body frame.
+Call events have `physics: null`. Source lines are one-based; occurrence IDs
+remain zero-based placement paths.
+
+The caller decides whether a placement succeeded. `state_finite` and
+`duration_matches` describe the final observation, not a guarantee of numerical
+validity throughout the trial or physical stability. Collision hulls may overlap,
+and independent parts have no clutch forces. Global energy is not reported,
+because hidden parts retain their compiled masses. Their contacts are disabled
+and gravity is compensated while they wait to be placed.
+
+An execution error halts further stepping until reset or reopening.
+`ExecutionError.result` and `program.last_result` retain completed events and
+the failing instruction, including its physics observation when available.
+Non-finite diagnostic numbers become JSON `null`. Cancelled operations also halt
+the program. Operations on the same interpreter must be awaited sequentially.
+Stepping after completion returns an empty completed result. Ctrl+C in the
+terminal closes the owned server; reopen the interpreter to restart.
+
+The CLI writes `scene.xml`, `scene.import.json`, `execution.json`, server
+diagnostics in `server.log`, and a flushed `events.jsonl` under
+`output/INPUT_STEM/execution/`; change the directory with `--output-dir`.
+The Python API writes these when `output_dir` is supplied.
+The preparation report includes the XML hash and the exact activation settings.
+XML contains all collision-capable bodies; the interpreter applies the recorded
+initial disabling settings after loading it. Each new session replaces those
+artifacts in its output directory; use distinct directories to retain runs.
+
+`--library`, `--shadow` / `--no-shadow`, `--density`, `--friction`, `--timestep`
+and `--clearance` configure import. Execution always covers the full input in
+individual-parts mode. Add `--viewer` to request the server's live viewer;
+unavailable graphics leave terminal execution available. The current server's
+viewer is display-dependent, including limitations on macOS.
+
+```sh
+# Script a debugger session, or type these commands interactively.
+printf 'step\nnext\ncontinue\nquit\n' | uv run --extra interpreter \
+  ldraw-mujoco execute data/models-annotated/106-1.mpd --seconds-per-part 0.1
+
+# Real MCP execution plus saved states and locally rendered inspection images.
+uv run --extra interpreter python examples/execute-106-1.py
+uv run --extra interpreter pytest -q
+```
+
+The example covers empty, first-part, nested-wheel and completed states, including
+a wheel detail. Local rendering uses the exact XML and returned MCP state;
+all time advancement remains in the MCP process.
+
 ## Optional simulation and configuration
 
 ```sh

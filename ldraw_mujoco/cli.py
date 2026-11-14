@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -19,6 +20,21 @@ def write_json(path, report):
     Path(path).write_text(text)
 
 
+def import_arguments(parser):
+    parser.add_argument("--library", type=Path)
+    shadow = parser.add_mutually_exclusive_group()
+    shadow.add_argument(
+        "--shadow", action="append", type=Path, help="Repeat for multiple shadow sources"
+    )
+    shadow.add_argument("--no-shadow", action="store_true")
+    parser.add_argument("--density", type=float, default=1050, help="Estimated density in kg/m³")
+    parser.add_argument("--friction", type=float, default=0.6, help="Sliding friction coefficient")
+    parser.add_argument("--timestep", type=float, default=0.001, help="Seconds")
+    parser.add_argument(
+        "--clearance", type=float, default=0.001, help="Initial ground clearance in meters"
+    )
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Import LDraw rigid assemblies into MuJoCo")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -27,12 +43,7 @@ def main(argv=None):
     convert = commands.add_parser("convert", help="Convert MPD/LDR/DAT to self-contained MJCF")
     convert.add_argument("input", type=Path)
     convert.add_argument("--output", type=Path, required=True)
-    convert.add_argument("--library", type=Path)
-    shadow = convert.add_mutually_exclusive_group()
-    shadow.add_argument(
-        "--shadow", action="append", type=Path, help="Repeat for multiple shadow sources"
-    )
-    shadow.add_argument("--no-shadow", action="store_true")
+    import_arguments(convert)
     convert.add_argument(
         "--section",
         action="append",
@@ -45,11 +56,13 @@ def main(argv=None):
         action="store_true",
         help="One independent free body per placed DAT part, never per geometric subpart",
     )
-    convert.add_argument("--density", type=float, default=1050, help="Estimated density in kg/m³")
-    convert.add_argument("--friction", type=float, default=0.6, help="Sliding friction coefficient")
-    convert.add_argument("--timestep", type=float, default=0.001, help="Seconds")
-    convert.add_argument(
-        "--clearance", type=float, default=0.001, help="Initial ground clearance in meters"
+    execute = commands.add_parser("execute", help="Debug type-1 placements through MuJoCo MCP")
+    execute.add_argument("input", type=Path)
+    import_arguments(execute)
+    execute.add_argument("--seconds-per-part", type=float, default=0.1)
+    execute.add_argument("--output-dir", type=Path, help="Default: output/INPUT_STEM/execution")
+    execute.add_argument(
+        "--viewer", action="store_true", help="Try the server's optional live viewer"
     )
     run = commands.add_parser("simulate", help="Simulate MJCF and report approximate behavior")
     run.add_argument("input", type=Path)
@@ -63,6 +76,10 @@ def main(argv=None):
     try:
         if args.command == "inspect":
             print(json.dumps(inspect_ldraw(args.input), indent=2, allow_nan=False))
+        elif args.command == "execute":
+            from .debugger import execute
+
+            return asyncio.run(execute(args))
         elif args.command == "convert":
             if args.output.resolve() == args.input.resolve():
                 raise ValueError("Output must not overwrite the LDraw input")
@@ -101,9 +118,12 @@ def main(argv=None):
                 f"contacts={data.ncon}, numerical warnings={report['warnings']}"
             )
             return 0 if report["numerically_valid"] else 1
-    except (OSError, ValueError, RuntimeError) as exc:
+    except (OSError, ValueError, RuntimeError, ExceptionGroup) as exc:
         print(f"ldraw-mujoco: {exc}", file=sys.stderr)
         return 1
+    except KeyboardInterrupt:
+        print("Execution interrupted; reopen the interpreter to restart.", file=sys.stderr)
+        return 130
     return 0
 
 

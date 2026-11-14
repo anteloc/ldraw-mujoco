@@ -82,6 +82,7 @@ class Document:
                 "kind": "model",
                 "reference": self.root.name,
                 "section": self.root.name,
+                "source_file": str(self.path),
                 "line": None,
             }
         }
@@ -104,6 +105,7 @@ class Document:
                 "kind": "submodel" if child is not None else "part",
                 "reference": piece.reference,
                 "section": self.root.name if model is self.view else model.name,
+                "source_file": str(self.path if model is self.view else self.origins[id(model)]),
                 "line": model.source_line_for(piece),
             }
             if child is not None:
