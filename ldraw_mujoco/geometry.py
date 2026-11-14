@@ -91,8 +91,13 @@ class Document:
         self.piece_indices = {}
         self._index(self.view, "root", ())
         for ident in self.placement_overrides:
-            if ident not in self.instances or self.instances[ident]["kind"] != "part":
-                raise ValueError(f"Edit requires a physical part occurrence ID: {ident!r}")
+            if ident not in self.instances or self.instances[ident]["kind"] == "model":
+                raise ValueError(f"Edit requires a type-1 occurrence ID: {ident!r}")
+        for ident, text in self.placement_overrides.items():
+            from .editing import validate_placement
+
+            validate_placement(text, original=self.instances[ident]["source_text"])
+            self.instances[ident]["source_text"] = text
         self.selected_ids = self._select(sections)
 
     def _index(self, model, parent, visiting):
@@ -114,6 +119,13 @@ class Document:
                 "section": self.root.name if model is self.view else model.name,
                 "source_file": str(source),
                 "line": line,
+                "context_comment": (
+                    self.source_lines[source][line - 2]
+                    if line
+                    and line > 1
+                    and self.source_lines[source][line - 2].lstrip().startswith("0 //")
+                    else None
+                ),
                 "source_text": self.source_lines[source][line - 1] if line else str(piece),
             }
             if child is not None:
@@ -260,7 +272,10 @@ class Document:
         try:
             return [
                 self._edited_occurrence(o)
-                if self.occurrence_id(o) in self.placement_overrides
+                if any(
+                    self.occurrence_id(o) == key or self.occurrence_id(o).startswith(key + "/")
+                    for key in self.placement_overrides
+                )
                 else o
                 for o in self.view.iter_occurrences()
                 if self.included(self.occurrence_id(o))
@@ -272,13 +287,25 @@ class Document:
         """Expand a private path through pyldraw3; repeated source instances stay untouched."""
         from .editing import validate_placement
 
-        ident = self.occurrence_id(occurrence)
-        line = self.placement_overrides[ident]
-        piece = validate_placement(line)
+        path = []
+        indices = []
+        for item in occurrence.path:
+            indices.append(str(self.piece_indices[id(item.piece)]))
+            ident = "/".join(indices)
+            piece = (
+                validate_placement(self.placement_overrides[ident])
+                if ident in self.placement_overrides
+                else item.piece
+            )
+            self.piece_indices[id(piece)] = self.piece_indices[id(item.piece)]
+            if id(item.piece) in self.inverted:
+                self.inverted.add(id(piece))
+            path.append(replace(item, piece=piece))
+        piece = path[-1].piece
         # A short private model chain lets pyldraw3 compose all ancestor affine
         # transforms and inherited colours, without mutating the source graph.
         root = current = Model(name="edit-root.ldr")
-        for index, item in enumerate(occurrence.path[:-1]):
+        for index, item in enumerate(path[:-1]):
             name = f"edit-ancestor-{index}.ldr"
             child = Model(name=name)
             current.objects = [
@@ -293,14 +320,6 @@ class Document:
             current = child
         current.objects = [piece]
         expanded = next(root.iter_occurrences())
-        original = occurrence.path[-1]
-        self.piece_indices[id(piece)] = self.piece_indices[id(original.piece)]
-        if id(original.piece) in self.inverted:
-            self.inverted.add(id(piece))
-        # Resolve a newly selected local DAT through the same discovery path.
-        self.origins[id(current)] = self.origins.get(id(original.model), self.path)
-        self._discover(current, set())
-        self.instances[ident].update(reference=piece.reference, source_text=line)
         return replace(
             occurrence,
             piece=piece,
@@ -309,7 +328,7 @@ class Document:
             colour=expanded.colour,
             position=expanded.position,
             matrix=expanded.matrix,
-            path=(*occurrence.path[:-1], replace(original, piece=piece)),
+            path=tuple(path),
         )
 
 

@@ -180,15 +180,15 @@ and `inspect` do not affect history; `reset` clears it. With no history, `u` doe
 You can execute forward again after undoing. History lasts only for this session;
 execution failures still require `reset` or reopening.
 
-Use `edit 0/19/0` (or `e 0/19/0`) to edit a physical DAT placement. The full line
-is prefilled; the leading `1` is fixed. Tab and Shift+Tab move between colour,
-coordinates, the nine transform entries, and the filename. Enter applies the
-line; Esc or Ctrl+C cancels the draft. Coordinates and matrix entries must be
-finite floats. Colour accepts integer codes or LDraw direct colours, and the
-reference must resolve to a DAT part. Filenames containing spaces remain one
-field. A rejected value gets a caret under the offending character, a brief
-explanation and a suggested fix. Choose `e` to return to its field or `c` to
-cancel and restore the line as it was before this edit.
+Use `edit 0/19/0` (or `e 0/19/0`) to edit a type-1 placement, including a
+submodel instance. Only x/y/z and the nine rotation-matrix values are editable.
+The leading `1`, colour and part/submodel reference are fixed. An immediately
+preceding `0 // …` comment is shown read-only when present, giving part/colour
+context. Tab and Shift+Tab move between numeric fields. Enter applies the line;
+Esc or Ctrl+C cancels the draft. All twelve entries must be finite floats and
+the transform must remain invertible. A rejected value gets a caret under the
+offending character, a brief explanation and a suggested fix. Choose `e` to
+return to its field or `c` to cancel and restore the pre-edit line.
 
 Edits affect **only that occurrence**, even inside a repeated submodel. Original
 files and libraries stay unchanged. The importer rebuilds the scene and evaluates

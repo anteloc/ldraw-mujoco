@@ -37,7 +37,7 @@ def field_spans(line):
     return spans
 
 
-def validate_placement(line):
+def validate_placement(line, *, original=None):
     """Validate editor field types, then delegate record parsing to pyldraw3."""
     spans = field_spans(line)
 
@@ -51,7 +51,7 @@ def validate_placement(line):
         reject(
             len(spans),
             "Missing type-1 fields",
-            "Provide colour, x y z, nine matrix values and a DAT reference",
+            "Provide colour, x y z, nine matrix values and a reference",
         )
     fields = [line[start:end] for start, end in spans]
     if fields[0] != "1":
@@ -81,11 +81,16 @@ def validate_placement(line):
     try:
         piece = parse_ldraw_line(line)
     except PartError as exc:
-        reject(14, str(exc), "Provide a valid DAT filename")
-    if not piece.reference.casefold().endswith(".dat"):
-        reject(
-            14, "A physical part must reference a DAT file", "Use a part filename such as 3001.dat"
-        )
+        reject(14, str(exc), "Provide a valid reference")
+    if original is not None:
+        original_fields = original.split(maxsplit=14)
+        for index in (0, 1, 14):
+            if fields[index] != original_fields[index]:
+                reject(
+                    index,
+                    f"{FIELDS[index]} is read-only",
+                    "Change only position and rotation values",
+                )
     if abs(np.linalg.det(piece.matrix.rows)) < 1e-12:
         reject(
             5,
@@ -102,7 +107,7 @@ def editor_bindings():
 
     def move(event, direction):
         buffer = event.current_buffer
-        starts = [start - 2 for start, _ in field_spans("1 " + buffer.text)[1:]]
+        starts = [token.start() for token in re.finditer(r"\S+", buffer.text)]
         if starts:
             current = max(0, bisect_right(starts, buffer.cursor_position) - 1)
             buffer.cursor_position = starts[(current + direction) % len(starts)]
@@ -121,30 +126,48 @@ async def edit_placement(program, ident, *, prompt=None, write=print):
     """Stage input until validation and scene preparation succeed, or discard it."""
     from prompt_toolkit import PromptSession
     from prompt_toolkit.document import Document
+    from prompt_toolkit.layout.processors import AfterInput
 
     original = program.placement_line(ident)
-    original_fields = original.split(maxsplit=1)[1]
-    line, cursor = "1 " + original_fields, 0
+    fields = original.split(maxsplit=14)
+    prefix, suffix = f"1 {fields[1]} ", " " + fields[14]
+    original_values = " ".join(fields[2:14])
+    values, cursor = original_values, 0
+    line = prefix + values + suffix
     if prompt is None:
         prompt = PromptSession().prompt_async
     bindings = editor_bindings()
-    write(f"Editing {ident}: {original}")
+    context = program.nodes[ident].get("context_comment")
+    write(f"Editing {ident}: position and rotation only.")
     write("Tab/Shift+Tab: next/previous field. Enter: apply. Esc or Ctrl+C: cancel.")
     while True:
         try:
-            # The instruction type is a prompt, so it cannot be edited or deleted.
-            text = line[2:]
+            # Fixed prefix/suffix stay outside the editable numeric buffer.
+            text = values
+            if context:
+                write(context)
             edited = await prompt(
-                "1 ", default=Document(text, min(cursor, len(text))), key_bindings=bindings
+                prefix,
+                default=Document(text, min(cursor, len(text))),
+                key_bindings=bindings,
+                input_processors=[AfterInput(suffix)],
             )
             if edited is None:
                 break
-            line = "1 " + edited
-            validate_placement(line)
-            return await program.edit(ident, original if edited == original_fields else line)
+            values = edited
+            line = prefix + values + suffix
+            if len(values.split()) != 12:
+                raise EditError(
+                    "Expected exactly 12 numeric values",
+                    column=len(prefix) + len(values),
+                    field_start=len(prefix),
+                    suggestion="Provide x y z and nine matrix values",
+                )
+            validate_placement(line, original=original)
+            return await program.edit(ident, original if edited == original_values else line)
         except EditError as exc:
             write(exc.display(line))
-            cursor = max(0, exc.field_start - 2)
+            cursor = max(0, exc.field_start - len(prefix))
             try:
                 choice = await prompt("Edit the error or cancel? [e/c] ")
                 while choice is not None and choice.strip().lower() not in {

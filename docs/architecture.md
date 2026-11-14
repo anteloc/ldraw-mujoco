@@ -206,19 +206,20 @@ trial. Reset clears history, and undo failures/cancellation halt execution until
 reset. The append-only event log includes `undo` records rather than erasing
 the commands they undo. Persistent sessions and redo are not implemented.
 
-`edit <part id>` stages a full placement line using prompt_toolkit. Its leading
-`1` is a non-editable prompt. Tab/Shift+Tab navigate field spans; filename spaces
-belong to the final field. Field-level UI validation supplies caret offsets and
+`edit <part id>` stages a full placement line using prompt_toolkit. Its type marker and colour
+are a non-editable prompt; the reference is a read-only suffix. Only the twelve
+position/matrix values are in the input buffer. Tab/Shift+Tab navigate those
+fields. An immediately preceding `0 // …` source comment is read-only context. Field-level UI validation supplies caret offsets and
 repair suggestions, while pyldraw3's `parse_ldraw_line` parses the actual record.
 Syntax errors retain the draft and return focus to the first failing field after
 the user chooses to correct it. Cancelling discards only the current draft.
 
-The importer accepts `placement_overrides`, mapping physical occurrence IDs to
+The importer accepts `placement_overrides`, mapping type-1 occurrence IDs to
 replacement type-1 lines. It expands a private chain of the occurrence's ancestor
 placements through pyldraw3, preserving inherited colours, affine transforms,
 source provenance and BFC ownership. It never mutates a shared source submodel or
-writes the source files. Overrides remain DAT leaves, so part IDs and call frames
-stay valid. Inventories include `source_text`, showing the effective line for
+writes the source files. Colour and references cannot change, so part IDs and call frames
+stay valid. Editing a submodel placement affects only that instance and its descendants. Inventories include `source_text`, showing the effective line for
 each occurrence. Source/dependency hashes remain hashes of the original files;
 reports retain the overrides and the execution XML hash scopes the edited scene.
 

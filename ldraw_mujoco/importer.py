@@ -80,7 +80,7 @@ def import_ldraw(
     IDs, ancestor transforms and colors; overlapping selections form a union.
     ``shadows=[]`` disables external connector metadata. The returned spec is
     compiled once for validation and is still editable by the caller.
-    ``placement_overrides`` maps physical occurrence IDs to replacement type-1
+    ``placement_overrides`` maps type-1 occurrence IDs to replacement type-1
     lines. It changes only those occurrences, leaving source files unchanged.
     """
     path = Path(path).resolve()

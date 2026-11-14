@@ -215,17 +215,17 @@ class Interpreter:
 
     def placement_line(self, ident):
         """Return this occurrence's current type-1 line, including session edits."""
-        if ident not in self.parts:
+        if ident not in self.nodes or self.nodes[ident]["kind"] == "model":
             raise ValueError(
-                f"Unknown physical part ID: {ident!r}; use where or inspect to find IDs"
+                f"Unknown type-1 occurrence ID: {ident!r}; use where or inspect to find IDs"
             )
         return self.nodes[ident]["source_text"]
 
     async def edit(self, ident, line):
-        """Replace one DAT occurrence for this session, preserving execution position."""
+        """Edit one type-1 occurrence transform for this session, preserving execution position."""
         self._check_ready()
         original = self.placement_line(ident)
-        validate_placement(line)
+        validate_placement(line, original=original)
         if line == original:
             return {"events": [], **self.status, "edited_id": ident, "changed": False}
         self._busy = True
@@ -324,10 +324,17 @@ class Interpreter:
         self.__dict__.update(candidate.__dict__)
         self._busy = True
         if reopen_viewer and viewer_error is None:
-            try:
-                await self.viewer()
-            except MCPError as exc:
-                viewer_error = str(exc)
+            # Native macOS viewer shutdown finishes asynchronously after close().
+            for attempt in range(20):
+                try:
+                    await self.viewer()
+                    break
+                except MCPError as exc:
+                    if "another MuJoCo viewer is already open" in str(exc) and attempt < 19:
+                        await asyncio.sleep(0.1)
+                    else:
+                        viewer_error = str(exc)
+                        break
         if viewer_error:
             self.viewer_error = viewer_error
             self._record({"kind": "viewer_unavailable", "error": viewer_error})
