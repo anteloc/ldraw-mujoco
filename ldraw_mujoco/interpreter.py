@@ -7,6 +7,10 @@ import hashlib
 import json
 import math
 import shutil
+import sys
+import tempfile
+import time
+import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import uuid4
@@ -65,7 +69,11 @@ class Interpreter:
         # Compile with collisions present so MuJoCo retains collision structures.
         # Nonzero gravcomp at compile time also initializes its cached body count.
         self.xml = imported.spec.to_xml()
-        model = mujoco.MjModel.from_xml_string(self.xml)
+        model = imported.spec.compile()
+        self._model = model
+        self._viewer = None
+        self._disableflags = int(model.opt.disableflags)
+        self._prepare_bootstrap()
         self.timestep = float(model.opt.timestep)
         self.steps = math.ceil(seconds_per_part / self.timestep)
         self.parts, self.activate, self.inactive = {}, {}, []
@@ -123,11 +131,12 @@ class Interpreter:
         self.failed = False
         self.last_result = None
         self._busy = False
-        self._realtime = False
         self.viewer_error = None
         self.output_dir = Path(output_dir) if output_dir is not None else None
         self.preparation = {
             "xml_sha256": hashlib.sha256(self.xml.encode()).hexdigest(),
+            "bootstrap_xml_sha256": hashlib.sha256(self._bootstrap_xml.encode()).hexdigest(),
+            "restored_disableflags": self._disableflags,
             "seconds_per_part": seconds_per_part,
             "steps_per_part": self.steps,
             "timestep_s": self.timestep,
@@ -149,16 +158,22 @@ class Interpreter:
 
         Import options are those of ``import_ldraw``, except selection/grouping.
         ``output_dir`` saves the exact XML, reports and a flushed JSONL event log.
-        ``viewer=True`` opens a native viewer and paces playback to real time.
+        ``viewer=True`` opens an independent browser viewer and paces connected playback.
         A failed window launch is recorded in ``viewer_error``; execution remains available.
         """
         if {"sections", "individual_parts"} & import_options.keys():
             raise ValueError("The interpreter always executes the full input as individual parts")
+        started = time.monotonic()
+        print("Importing and compiling LDraw geometry…", file=sys.stderr)
+        imported = import_ldraw(path, individual_parts=True, **import_options)
+        imported_at = time.monotonic()
+        print("Preparing execution model…", file=sys.stderr)
         program = cls(
-            import_ldraw(path, individual_parts=True, **import_options),
+            imported,
             seconds_per_part=seconds_per_part,
             output_dir=output_dir,
         )
+        del imported  # The editable spec is large; execution retains the compiled model and XML.
         program._import_options.update(
             {
                 k: v
@@ -166,19 +181,44 @@ class Interpreter:
                 if v is not None and k != "placement_overrides"
             }
         )
+        program.preparation["timings_s"] = {
+            "import": imported_at - started,
+            "prepare": time.monotonic() - imported_at,
+        }
+        if program.output_dir is not None:
+            program.output_dir.mkdir(parents=True, exist_ok=True)
+            (program.output_dir / "events.jsonl").write_text("")
         log_path = program.output_dir / "server.log" if program.output_dir else None
-        async with MujocoClient.connect(log_path=log_path, viewer=viewer) as client:
-            await program._load(client)
-            try:
-                if viewer:
-                    try:
-                        await program.viewer()
-                    except MCPError as exc:
-                        program.viewer_error = str(exc)
-                        program._record({"kind": "viewer_unavailable", "error": str(exc)})
+        try:
+            if viewer:
+                print("Preparing browser scene…", file=sys.stderr)
+                before = time.monotonic()
+                try:
+                    await program.viewer()
+                except MCPError as exc:
+                    program.viewer_error = str(exc)
+                program.preparation["timings_s"]["browser"] = time.monotonic() - before
+            print("Loading physics with inactive parts…", file=sys.stderr)
+            async with MujocoClient.connect(log_path=log_path) as client:
+                await program._load(client)
+                print(f"Execution ready ({time.monotonic() - started:.1f}s).", file=sys.stderr)
                 yield program
-            finally:
-                program.client = None
+        finally:
+            if program._viewer is not None:
+                program._viewer.close()
+            program.client = None
+
+    def _prepare_bootstrap(self):
+        # This is MJCF, not LDraw. Preserve the canonical artifact separately.
+        root = ET.fromstring(self.xml)
+        option = root.find("option")
+        if option is None:
+            option = ET.SubElement(root, "option")
+        flag = option.find("flag")
+        if flag is None:
+            flag = ET.SubElement(option, "flag")
+        flag.set("contact", "disable")
+        self._bootstrap_xml = ET.tostring(root, encoding="unicode")
 
     async def _call(self, tool, **arguments):
         if self.client is None:
@@ -187,14 +227,34 @@ class Interpreter:
 
     async def _load(self, client):
         self.client = client
-        summary = await client.call("sim_load", name=self.slot, xml_string=self.xml)
+        before = time.monotonic()
+        # The owned stdio server shares this filesystem. Retain the bootstrap
+        # through loading; do not put a large mesh payload into a JSON request.
+        with tempfile.TemporaryDirectory(prefix="ldraw-bootstrap-") as directory:
+            path = Path(directory) / "bootstrap.xml"
+            path.write_text(self._bootstrap_xml)
+            summary = await client.call("sim_load", name=self.slot, xml_path=str(path))
+        # modify_model runs forward automatically: leave contacts disabled until
+        # every inactive mask has been applied successfully, then restore options.
+        await self._call("modify_model", modifications=self.inactive)
+        await self._call(
+            "modify_model",
+            modifications=[
+                {
+                    "element": "option",
+                    "field": "disableflags",
+                    "value": self._disableflags,
+                }
+            ],
+        )
+        self.preparation.setdefault("timings_s", {})["physics_load"] = time.monotonic() - before
         if any(summary[k] != v for k, v in self.model_dimensions.items()):
             raise MCPError("Loaded model dimensions differ from the prepared XML")
         if not set(p["body"] for p in self.parts.values()) <= set(summary["bodies"]):
             raise MCPError("Loaded model is missing expected part bodies")
         if self.output_dir is not None:
             self._save_scene()
-            (self.output_dir / "events.jsonl").write_text("")
+            (self.output_dir / "events.jsonl").touch(exist_ok=True)
         self._record(
             {"kind": "load", "xml_sha256": self.preparation["xml_sha256"], "server": summary}
         )
@@ -205,6 +265,7 @@ class Interpreter:
             return
         self.output_dir.mkdir(parents=True, exist_ok=True)
         (self.output_dir / "scene.xml").write_text(self.xml)
+        (self.output_dir / "bootstrap.xml").write_text(self._bootstrap_xml)
         for name, payload in (
             ("scene.import.json", self.report),
             ("execution.json", self.preparation),
@@ -219,6 +280,8 @@ class Interpreter:
             raise ValueError(
                 f"Unknown type-1 occurrence ID: {ident!r}; use where or inspect to find IDs"
             )
+        if self.nodes[ident].get("generated"):
+            raise ValueError("Inline geometry has no source placement; edit its parent assembly")
         return self.nodes[ident]["source_text"]
 
     async def edit(self, ident, line):
@@ -286,6 +349,10 @@ class Interpreter:
         candidate = Interpreter(imported, seconds_per_part=self.seconds_per_part)
         if restore_state:
             candidate.xml = checkpoint["xml"]
+            candidate._prepare_bootstrap()
+            candidate.preparation["bootstrap_xml_sha256"] = hashlib.sha256(
+                candidate._bootstrap_xml.encode()
+            ).hexdigest()
             candidate.preparation["xml_sha256"] = hashlib.sha256(candidate.xml.encode()).hexdigest()
         candidate.slot, candidate._spare_slot = self._spare_slot, self.slot
         candidate._import_options = dict(self._import_options)
@@ -311,37 +378,24 @@ class Interpreter:
         if self.output_dir is not None:
             archive = self.output_dir / "revisions" / self.preparation["xml_sha256"]
             archive.mkdir(parents=True, exist_ok=True)
-            for name in ("scene.xml", "scene.import.json", "execution.json"):
+            for name in ("scene.xml", "bootstrap.xml", "scene.import.json", "execution.json"):
                 shutil.copy2(self.output_dir / name, archive / name)
         candidate._save_scene()
-        reopen_viewer = self._realtime
-        viewer_error = None
-        if reopen_viewer:
-            try:
-                await self._call("viewer_close")
-            except MCPError as exc:
-                viewer_error = f"Could not close the previous viewer: {exc}"
+        browser = self._viewer
         self.__dict__.update(candidate.__dict__)
         self._busy = True
-        if reopen_viewer and viewer_error is None:
-            # Native macOS viewer shutdown finishes asynchronously after close().
-            for attempt in range(20):
-                try:
-                    await self.viewer()
-                    break
-                except MCPError as exc:
-                    if "another MuJoCo viewer is already open" in str(exc) and attempt < 19:
-                        await asyncio.sleep(0.1)
-                    else:
-                        viewer_error = str(exc)
-                        break
-        if viewer_error:
-            self.viewer_error = viewer_error
-            self._record({"kind": "viewer_unavailable", "error": viewer_error})
+        self._viewer = browser
+        if browser is not None:
+            try:
+                browser.set_scene(self._model, enabled_bodies=self._enabled_bodies(self.enabled))
+                self._publish(self._state, self.enabled)
+            except Exception as exc:
+                self._viewer_failed(exc)
         return physics
 
     def _record(self, event):
         if self.output_dir is not None:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
             with (self.output_dir / "events.jsonl").open("a") as stream:
                 stream.write(json.dumps(_json_safe(event), allow_nan=False) + "\n")
 
@@ -388,17 +442,56 @@ class Interpreter:
             result = {"events": [], **self.status}
             self.last_result = result
             self._record({"kind": "reset", **result})
+            self._publish(None, [])
             return result
         finally:
             self._busy = False
 
     async def viewer(self):
-        """Open/reopen the live viewer; on macOS use open(viewer=True) to select mjpython."""
-        result = await self._call("viewer_open")
-        self._realtime = True
-        self.viewer_error = None
-        self._record({"kind": "viewer_open", "realtime": True})
-        return result
+        """Open/reopen the local browser; simulation remains in the MCP process."""
+        from .viewer import BrowserViewer
+
+        try:
+            if self._viewer is None:
+                self._viewer = BrowserViewer(
+                    self._model, enabled_bodies=self._enabled_bodies(self.enabled)
+                )
+            self._publish(
+                self._state,
+                self.enabled,
+                status="Loading physics" if self.client is None else "Paused",
+            )
+            result = self._viewer.open()
+            self.viewer_error = (
+                None if result["opened"] else "Open the printed browser URL manually"
+            )
+            self._record({"kind": "viewer_open", **result})
+            return result
+        except Exception as exc:
+            self._viewer_failed(exc)
+            raise MCPError(f"Browser viewer unavailable: {exc}") from exc
+
+    def _enabled_bodies(self, enabled):
+        return [self._model.body(self.parts[ident]["body"]).id for ident in enabled]
+
+    def _viewer_failed(self, exc):
+        self.viewer_error = str(exc)
+        if self._viewer is not None:
+            self._viewer.close()
+            self._viewer = None
+        self._record({"kind": "viewer_unavailable", "error": str(exc)})
+        print(f"Browser viewer unavailable: {exc}", file=sys.stderr)
+
+    def _publish(self, state, enabled, *, status="Paused"):
+        if self._viewer is not None:
+            try:
+                self._viewer.publish(
+                    self._model.qpos0 if state is None else state["qpos"],
+                    self._enabled_bodies(enabled),
+                    status=status,
+                )
+            except Exception as exc:
+                self._viewer_failed(exc)
 
     def _check_ready(self):
         if self._busy:
@@ -454,6 +547,7 @@ class Interpreter:
                 "xml_sha256": self.preparation["xml_sha256"],
             }
             self._record({"kind": "undo", **self.last_result})
+            self._publish(self._state, self.enabled)
             return self.last_result
         except (Exception, asyncio.CancelledError) as exc:
             self.failed = True
@@ -476,12 +570,20 @@ class Interpreter:
         await self._call("sim_reset")
         await self._call("modify_model", modifications=self.activate[ident])
         remaining = self.steps
+        started = time.monotonic()
+        self._publish(None, [*self.enabled, ident], status="Running")
         while remaining:
-            count = min(remaining, 100_000)
-            await self._call("sim_step", n_steps=count, realtime=self._realtime)
+            connected = self._viewer is not None and self._viewer.connected
+            count = min(remaining, max(1, round(0.05 / self.timestep)) if connected else 100_000)
+            state = await self._call("sim_step", n_steps=count)
             remaining -= count
+            self._publish(state, [*self.enabled, ident], status="Running")
+            if connected:
+                target = (self.steps - remaining) * self.timestep
+                await asyncio.sleep(max(0, target - (time.monotonic() - started)))
         state, physics = await self._observe([*self.enabled, ident])
         self._state = state
+        self._publish(state, [*self.enabled, ident])
         return _json_safe(
             {
                 **physics,
@@ -609,6 +711,9 @@ class Interpreter:
                     or (mode == "out" and len(self._stack) < depth)
                 ):
                     break
+            self._publish(
+                self._state, self.enabled, status="Finished" if not self._stack else "Paused"
+            )
             if events:
                 self._history.append(checkpoint)
             self.last_result = {"events": events, **self.status}

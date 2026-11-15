@@ -203,3 +203,117 @@ def test_sample_counts_and_xml_round_trip(sample):
         np.testing.assert_allclose(
             a.qvel[6 * body + 3 : 6 * body + 6], b.qvel[6 * body + 3 : 6 * body + 6], atol=5e-3
         )
+
+
+@pytest.mark.parametrize("individual", [False, True])
+def test_inline_faces_match_explicit_dat(build, small_library, individual):
+    faces = (small_library / "parts/cube.dat").read_text()
+    # Exercise quad splitting and BFC changes between faces as well as colours.
+    faces += "0 BFC CW\n4 15 -10 0 -10 10 0 -10 10 0 10 -10 0 10\n"
+    header = (
+        "0 FILE root.ldr\n0 BFC INVERTNEXT\n"
+        "1 4 30 10 20 -2 0.1 0 0 1 0 0 0 1 child.ldr\n"
+        f"1 1 100 0 0 {IDENTITY} child.ldr\n0 FILE child.ldr\n"
+        f"1 16 40 0 0 {IDENTITY} cube.dat\n"
+    )
+    implicit = build(header + faces, suffix=".mpd", individual_parts=individual)
+    explicit = build(
+        header + f"1 16 0 0 0 {IDENTITY} faces.dat\n0 FILE faces.dat\n" + faces,
+        suffix=".mpd", individual_parts=individual,
+    )
+    assert [o["id"] for o in implicit.report["occurrences"]] == [
+        "0/0", "0/inline", "1/0", "1/inline"
+    ]
+    assert [b["occurrence_count"] for b in implicit.report["bodies"]] == (
+        [1, 1, 1, 1] if individual else [2, 2]
+    )
+    a, b = implicit.spec.compile(), explicit.spec.compile()
+    for field in ("mesh_vert", "mesh_face", "geom_rgba", "body_mass", "body_inertia"):
+        np.testing.assert_allclose(getattr(a, field), getattr(b, field))
+    reloaded = mujoco.MjModel.from_xml_string(implicit.spec.to_xml())
+    np.testing.assert_allclose(collision_points(a), collision_points(reloaded), atol=1e-7)
+
+
+def test_inline_inventory_selection_and_edits(tmp_path, small_library):
+    faces = (small_library / "parts/cube.dat").read_text()
+    source = (
+        f"0 FILE root.ldr\n1 4 20 0 0 {IDENTITY} child.ldr\n"
+        f"1 1 80 0 0 {IDENTITY} child.ldr\n"
+        f"0 FILE child.ldr\n{faces}"
+    )
+    path = tmp_path / "input.mpd"
+    path.write_text(source)
+    inventory = Document(path).inventory()
+    generated = [n for n in inventory["instances"] if n.get("generated")]
+    assert [n["id"] for n in generated] == ["0/inline", "1/inline"]
+    assert all(n["line"] is None for n in generated)
+    result = import_ldraw(
+        path, library=small_library, shadows=[], cache=tmp_path / "cache",
+        sections="child.ldr:1",
+        placement_overrides={"1": f"1 1 120 0 0 {IDENTITY} child.ldr"},
+    )
+    assert [o["id"] for o in result.report["occurrences"]] == ["1/inline"]
+    assert result.report["occurrences"][0]["position_ldu"] == [120, 0, 0]
+    assert result.report["occurrences"][0]["colour"] == 1
+    with pytest.raises(ValueError, match="type-1"):
+        Document(path, placement_overrides={"1/inline": generated[1]["source_text"]})
+    assert path.read_text() == source
+    assert list(tmp_path.glob("*.dat")) == []
+
+
+def test_root_inline_faces(build, small_library):
+    faces = (small_library / "parts/cube.dat").read_text()
+    result = build(faces)
+    assert [o["id"] for o in result.report["occurrences"]] == ["inline"]
+    assert result.report["bodies"][0]["instance_id"] == "root"
+    assert result.spec.compile().nq == 7
+
+
+def test_missing_dat_resolves_unique_prefixed_section(build, small_library, tmp_path):
+    faces = (small_library / "parts/cube.dat").read_text()
+    source = (
+        f"0 FILE main.ldr\n1 4 20 0 0 {IDENTITY} custom.dat\n"
+        f"0 FILE model - custom.dat\n{faces}"
+    )
+    result = build(source, suffix=".mpd")
+    assert result.report["reference_aliases"] == {"custom.dat": "model - custom.dat"}
+    assert result.report["warnings"][0]["code"] == "embedded_dat_alias"
+    assert result.report["occurrences"][0]["id"] == "0"
+    assert result.report["occurrences"][0]["reference"] == "custom.dat"
+    assert (tmp_path / "input.mpd").read_text() == source
+    explicit = build(source.replace(f"{IDENTITY} custom.dat", f"{IDENTITY} model - custom.dat"),
+                     suffix=".mpd")
+    np.testing.assert_allclose(collision_points(result.spec.compile()),
+                               collision_points(explicit.spec.compile()))
+    assert mujoco.MjModel.from_xml_string(result.spec.to_xml()).nq == 7
+
+
+def test_prefixed_dat_fallback_rejects_ambiguity(build, small_library):
+    faces = (small_library / "parts/cube.dat").read_text()
+    with pytest.raises(ValueError, match="Ambiguous embedded DAT.*a - custom.dat, b - custom.dat"):
+        build(
+            f"0 FILE main.ldr\n1 4 0 0 0 {IDENTITY} custom.dat\n"
+            f"0 FILE a - custom.dat\n{faces}\n0 FILE b - custom.dat\n{faces}",
+            suffix=".mpd",
+        )
+
+
+def test_prefixed_dat_does_not_replace_exact_library_part(build):
+    result = build(
+        f"0 FILE main.ldr\n1 4 0 0 0 {IDENTITY} cube.dat\n"
+        "0 FILE model - cube.dat\n0 Empty decoy\n",
+        suffix=".mpd",
+    )
+    assert result.report["reference_aliases"] == {}
+    assert result.spec.compile().body_mass[1] > 0
+
+
+def test_prefixed_dat_does_not_replace_exact_document_part(build, small_library):
+    faces = (small_library / "parts/cube.dat").read_text()
+    result = build(
+        f"0 FILE main.ldr\n1 4 0 0 0 {IDENTITY} custom.dat\n"
+        f"0 FILE custom.dat\n{faces}\n0 FILE model - custom.dat\n0 Empty decoy\n",
+        suffix=".mpd",
+    )
+    assert result.report["reference_aliases"] == {}
+    assert result.spec.compile().body_mass[1] > 0

@@ -16,6 +16,8 @@ dependencies = [
     "trimesh>=4.6,<5",
     "scipy>=1.15,<2",
     "pillow>=11,<13",
+    "networkx>=3,<4",
+    "viser==1.1.1",
 ]
 
 [project.scripts]
@@ -29,7 +31,11 @@ interpreter = [
 ]
 
 [dependency-groups]
-dev = ["pytest>=9,<10", "ruff>=0.14"]
+dev = [
+    "playwright>=1.40,<2",
+    "pytest>=9,<10",
+    "ruff>=0.14",
+]
 
 [tool.setuptools.packages.find]
 include = ["ldraw_mujoco*"]

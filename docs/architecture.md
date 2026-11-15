@@ -21,7 +21,13 @@ explicitly selected alternatives. Original data is read-only.
 
 `geometry.Document` uses pyldraw3 to parse source documents and resolve their
 namespace. External local LDRs and embedded DATs are supported. Ambiguous
-external section names fail explicitly. Assembly traversal uses
+external section names fail explicitly. If an exact DAT reference is absent
+from both the document and library, a unique document-local section ending in
+` - reference.dat` supplies its geometry. This narrowly handles partially
+namespaced MPDs without editing their source. Ambiguous suffix matches fail;
+malformed library parts do not trigger fallback. Reports retain the original
+reference and IDs, and record `reference_aliases` plus `embedded_dat_alias`
+warnings, including aliases encountered inside DAT geometry. Assembly traversal uses
 `Model.iter_occurrences()` with embedded DATs excluded from assembly expansion;
 a DAT is one physical occurrence even when it contains many primitives.
 
@@ -30,7 +36,18 @@ part geometry in local coordinates, splits each quad into two triangles, and
 caches those surfaces by reference. It propagates colors, BFC winding and
 INVERTNEXT, and reverses faces for reflected transforms. Lines and conditional
 line control points are excluded. Degenerate faces are counted and omitted.
-TEXMAP/DATA and assembly-level inline faces fail explicitly in this version.
+TEXMAP/DATA fail explicitly. Assembly-level inline faces are collected into one
+in-memory DAT leaf per section, retaining parsed records and BFC state. Source
+files remain unchanged. Existing references stay in their assembly, so they are
+not duplicated or absorbed into the generated hull. Each generated occurrence
+has an `inline` path suffix (`inline` at root), a null source line and
+`generated: inline_faces` in the inventory. Source type-1 IDs stay unchanged.
+The generated leaf follows normal grouping/selection and inherits ancestor
+transforms, colours and INVERTNEXT. It cannot be edited as a source type-1 line;
+edit its parent placement instead. Individual-parts mode treats the face
+collection as one rigid part; the default welds it with the assembly’s direct
+parts. Like other parts, its points must span a 3D hull (no invented thickness
+for planar-only collections).
 
 `importer` bakes placement matrices into vertices. This preserves scale/shear
 in the sample's arm and hand placements without claiming they are rigid
@@ -43,7 +60,8 @@ and transparency. These meshes use shell inertia mode to permit planar patches
 but contribute no mass. An isolated triangle is subdivided without changing its
 surface, because MuJoCo requires at least four mesh vertices.
 
-trimesh constructs one convex hull per physical occurrence. Only these hulls
+trimesh constructs one convex hull per physical occurrence. NetworkX is an
+explicit dependency for trimesh’s hull winding/normal repair path. Only these hulls
 contribute contacts, mass and inertia. MuJoCo handles their local mesh offsets,
 inertial frames and combination into each body's mass distribution. We avoid
 custom inertia formulas and signed-volume assumptions about open LDraw meshes.
@@ -226,7 +244,7 @@ reports retain the overrides and the execution XML hash scopes the edited scene.
 An accepted edit prepares the full scene in a spare MCP slot, reapplies the
 enabled set, and evaluates one CAD trial. The current scene is replaced only
 after preparation succeeds. Two slot names alternate, bounding server model
-storage even after repeated edits. The viewer is reopened after replacement;
+storage even after repeated edits. The browser assets are replaced while keeping the camera;
 rendering failures do not prevent terminal execution. Edits checkpoint the exact
 previous XML, report, line overrides, call stack, enabled IDs and live state.
 Undo rebuilds from that saved XML and restores the saved poses/velocities after
@@ -253,9 +271,16 @@ may disagree with the interpreter's enabled-part list.
 The execution XML retains every mesh and free body. Before exporting it, set
 gravity compensation on every part so MuJoCo initializes its compensation
 bookkeeping at compilation. Keep collision masks enabled during compilation
-so collision structures are retained. After MCP loads the XML, a batch update
+so collision structures are retained. The interpreter retains a canonical
+`scene.xml` and derives `bootstrap.xml` with only the runtime contact flag
+disabled. The headless MCP server loads that file by path; its automatic
+`mj_forward` cannot solve contacts for the assembled model. A first batch
 hides every geom, zeros geom and body contact masks, and keeps gravity
-compensated. These inactive bodies retain mass and inertia but cannot contact
+compensated. Only after that batch succeeds does a separate option update
+restore the exact original disableflags. A failed update cannot re-enable
+contacts prematurely. This same sequence handles edit/undo candidate scenes.
+Without an output directory, bootstrap files live in an owned temporary
+directory for the duration of loading. These inactive bodies retain mass and inertia but cannot contact
 the enabled assembly. Do not zero masses or edit free-joint topology.
 
 For each part, `sim_reset` restores all poses, velocities, warmstarts and time.
@@ -285,28 +310,43 @@ the exception/result/log; reset reapplies all inactive settings before rewinding
 Cancellation also marks execution halted. Concurrent debugger operations are
 rejected. Exiting the context closes the owned process and its viewer.
 
-The CLI provides the debugger commands, one-line explanations through `help`,
-and an optional server viewer. Headless
-operation is fully supported. `Interpreter.open(viewer=True)` selects MuJoCo's
-`mjpython -m mujoco_mcp` launcher on macOS. Its environment includes the base
-Python `LIBDIR` in `DYLD_FALLBACK_LIBRARY_PATH`, avoiding uv virtual-environment
-symlink resolution failures. Other platforms and ordinary headless sessions
-use the installed `mujoco-mcp` entrypoint. The pinned server detects native
-CGL/GLFW instead of requiring Linux display variables on macOS/Windows.
+The CLI provides debugger commands and a separate browser inspection service.
+`viewer.BrowserViewer` uses pinned Viser 1.1.1: its wheel supplies the client,
+WebSocket transport, camera controls and batching. The service binds loopback
+only and disables sharing. Both commands use the ordinary Python launcher;
+MCP runs with `MUJOCO_MCP_NO_RENDER=1` and never owns a viewer or GL renderer.
 
-Opening the viewer enables `sim_step(realtime=True)`. The server synchronizes
-the actual slot's model/data approximately every 1/60 simulated second and
-sleeps only as needed to pace playback while the window is open. It preserves
-the requested number of physics steps and their timestep. Closing the viewer
-lets the same simulation finish without pacing. Reopening restores paced
-playback. The CAD reset between placements is visible; no alternate simulation
-or trajectory playback is involved. Window-launch errors are recorded in
-`viewer_error` and the event log. Startup errors include the server log tail.
+Browser geometry comes from compiled visual mesh vertices/faces and geom-local
+transforms; native primitives use trimesh tessellation. Collision hulls stay
+hidden. Identical geometry shares a batched mesh; per-instance colour, opacity,
+and transforms remain distinct. There is no mesh simplification or additional
+LDraw parser. Unsupported visual types fail viewer preparation explicitly while
+leaving physics available. The view uses Z-up metres. Separate render MjData
+receives only qpos and `mj_kinematics`, never forward dynamics or stepping.
+Unplaced bodies use their initial CAD transforms and 15% of their original
+opacity; ghosting does not modify the simulation model. Accepted edits rebuild
+assets on the existing service; rejected edits preserve the previous view.
+
+Connected execution uses roughly 50 ms chunks of the same native simulation
+steps and publishes each returned qpos. Wall-clock pacing happens in the client,
+not the MCP viewer. Chunks never change timestep or total steps; disconnected
+runs use the ordinary larger batches. Reset, undo and replacement publish exact
+current state without stepping. Browser camera input and reconnection are
+handled by Viser's separate server thread, independent of simulation calls.
+
+`simulate --viewer` uses the same presentation adapter with every body active.
+It publishes the initial picture before forward dynamics; genuine expensive
+contact solves remain possible, but do not freeze camera interaction. The
+simulation loop publishes about 20 times per simulated second and continues
+if the browser closes or fails. The CLI owns the service through report/snapshot
+saving and final interactive inspection (Enter/Ctrl+C to close). Noninteractive
+runs and Python `simulate(viewer=True)` close the service upon completion.
+The viewer offers only inspection controls; terminal commands own physics.
 
 Interactive input uses prompt_toolkit's async
 prompt so Ctrl+C can exit without a blocked input thread. Server stderr is
-captured separately in `server.log`. Artifacts include the exact loaded XML and hash,
-import evidence, preparation/activation settings, and a flushed JSONL log.
+captured separately in `server.log`. Artifacts include canonical and bootstrap XML with hashes, restored option
+flags, phase timings, import evidence, activation settings, and a flushed JSONL log.
 The XML represents the complete collision-capable scene: replay its recorded
 initialization to reproduce the empty interpreter state. Reset events separate
 runs within one log; a fresh session replaces artifacts in its output directory.

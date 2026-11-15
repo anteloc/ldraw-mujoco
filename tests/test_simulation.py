@@ -67,3 +67,64 @@ def test_sample_five_seconds(sample):
 def test_invalid_duration(build, seconds):
     with pytest.raises(ValueError, match="positive"):
         simulate(build(PLACEMENT).spec.compile(), seconds=seconds)
+
+
+def test_browser_playback_preserves_simulation_and_survives_disconnect(build):
+    from ldraw_mujoco.simulation import _simulate
+
+    class Viewer:
+        connected = True
+        frames = []
+
+        def publish(self, qpos, **kwargs):
+            self.frames.append((np.array(qpos).copy(), kwargs["status"]))
+            if len(self.frames) > 2:
+                self.connected = False
+
+    m = build(PLACEMENT, timestep=0.007).spec.compile()
+    a, expected = simulate(m, seconds=0.113)
+    viewer = Viewer()
+    b, report = _simulate(m, seconds=0.113, handle=viewer)
+    np.testing.assert_array_equal(a.qpos, b.qpos)
+    np.testing.assert_array_equal(a.qvel, b.qvel)
+    assert report == expected
+    assert viewer.frames[0][1] == "Loading physics"
+    assert viewer.frames[-1][1] == "Finished"
+
+
+def test_cli_saves_report_before_final_inspection_and_closes_service(build, tmp_path, monkeypatch):
+    import builtins
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    import ldraw_mujoco.cli as cli
+    import ldraw_mujoco.viewer as browser
+
+    path = tmp_path / "scene.xml"
+    path.write_text(build(PLACEMENT).spec.to_xml())
+    report = path.with_suffix(".simulation.json")
+    closed = []
+
+    class Viewer:
+        connected = False
+
+        def publish(self, *_args, **_kwargs):
+            pass
+
+    @contextmanager
+    def session(model, *, enabled):
+        assert enabled
+        try:
+            yield Viewer()
+        finally:
+            closed.append(True)
+
+    def finish(_):
+        assert report.exists()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(browser, "browser_session", session)
+    monkeypatch.setattr(cli.sys, "stdin", SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr(builtins, "input", finish)
+    assert cli.main(["simulate", str(path), "--seconds", "0.01", "--viewer"]) == 0
+    assert closed == [True]

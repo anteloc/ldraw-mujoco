@@ -44,8 +44,11 @@ class NativeClient:
         if tool == self.failure:
             raise MCPError("injected tool failure")
         if tool == "sim_load":
-            self.model = mujoco.MjModel.from_xml_string(args["xml_string"])
+            self.model = mujoco.MjModel.from_xml_path(args["xml_path"])
             self.data = mujoco.MjData(self.model)
+            mujoco.mj_forward(self.model, self.data)
+            self.load_contacts = self.data.ncon
+            self.load_disableflags = int(self.model.opt.disableflags)
             return {
                 **{k: getattr(self.model, k) for k in ("nq", "nv", "nbody")},
                 "bodies": [self.model.body(i).name for i in range(self.model.nbody)],
@@ -53,8 +56,11 @@ class NativeClient:
         m, d = self.model, self.data
         if tool == "modify_model":
             for change in args["modifications"]:
-                index = getattr(m, change["element"])(change["name"]).id
-                getattr(m, change["element"] + "_" + change["field"])[index] = change["value"]
+                if change["element"] == "option":
+                    setattr(m.opt, change["field"], change["value"])
+                else:
+                    index = getattr(m, change["element"])(change["name"]).id
+                    getattr(m, change["element"] + "_" + change["field"])[index] = change["value"]
         elif tool == "sim_reset":
             mujoco.mj_resetData(m, d)
         elif tool == "sim_step":
@@ -72,7 +78,12 @@ class NativeClient:
         else:
             assert tool == "sim_forward"
         mujoco.mj_forward(m, d)
-        return {"n_contacts": d.ncon, "time": d.time}
+        return {
+            "n_contacts": d.ncon,
+            "time": d.time,
+            "qpos": d.qpos.tolist(),
+            "qvel": d.qvel.tolist(),
+        }
 
 
 @pytest.fixture
@@ -636,8 +647,6 @@ def test_terminal_controls_and_artifact_hash(program):
             metadata["xml_sha256"]
             == hashlib.sha256((program.output_dir / "scene.xml").read_bytes()).hexdigest()
         )
-        with pytest.raises(MCPError, match="No display"):
-            await program.viewer()
         assert not program.failed
 
     asyncio.run(check())
@@ -685,45 +694,55 @@ def test_duration_validation_and_rounding(build):
     assert Interpreter(imported, seconds_per_part=0.0011).steps == 2
 
 
-@pytest.mark.parametrize(
-    "platform, graphical, executable, arguments",
-    [
-        ("darwin", True, "mjpython", ["-m", "mujoco_mcp"]),
-        ("darwin", False, "mujoco-mcp", []),
-        ("linux", True, "mujoco-mcp", []),
-    ],
-)
-def test_viewer_launcher_uses_installed_environment(
-    monkeypatch, tmp_path, platform, graphical, executable, arguments
-):
+def test_server_launcher_uses_installed_environment(monkeypatch, tmp_path):
     import ldraw_mujoco.mcp as adapter
 
-    monkeypatch.setattr(adapter.sys, "platform", platform)
     monkeypatch.setattr(adapter.sysconfig, "get_path", lambda _: str(tmp_path))
+    executable = "mujoco-mcp.exe" if adapter.os.name == "nt" else "mujoco-mcp"
     (tmp_path / executable).touch()
-    assert server_command(viewer=graphical) == (str(tmp_path / executable), arguments)
+    assert server_command() == (str(tmp_path / executable), [])
+
+
+class FakeViewer:
+    connected = True
+
+    def __init__(self, model, **kwargs):
+        self.model, self.frames, self.closed = model, [], False
+
+    def open(self):
+        return {"url": "http://127.0.0.1:12345", "opened": True}
+
+    def publish(self, qpos, enabled_bodies=None, **kwargs):
+        self.frames.append((np.array(qpos).copy(), enabled_bodies, kwargs))
+
+    def set_scene(self, model, **kwargs):
+        self.model = model
+
+    def close(self):
+        self.closed = True
 
 
 @pytest.mark.parametrize("available", [True, False])
 def test_viewer_option_paces_success_and_preserves_headless_fallback(
     monkeypatch, tmp_path, small_library, available
 ):
+    import ldraw_mujoco.viewer as browser
+
     client = NativeClient()
-    original = client.call
 
-    async def call(tool, **args):
-        if available and tool == "viewer_open":
-            return {"ok": True}
-        return await original(tool, **args)
-
-    client.call = call
+    class Viewer(FakeViewer):
+        def __init__(self, *args, **kwargs):
+            if not available:
+                raise RuntimeError("Browser unavailable")
+            super().__init__(*args, **kwargs)
 
     @asynccontextmanager
     async def connect(**kwargs):
-        assert kwargs["viewer"] is True
+        assert "viewer" not in kwargs
         yield client
 
     monkeypatch.setattr(MujocoClient, "connect", connect)
+    monkeypatch.setattr(browser, "BrowserViewer", Viewer)
     source = tmp_path / "viewer.mpd"
     source.write_text(PROGRAM)
 
@@ -732,10 +751,14 @@ def test_viewer_option_paces_success_and_preserves_headless_fallback(
             source, library=small_library, shadows=[], cache=tmp_path / "cache", viewer=True
         ) as program:
             assert bool(program.viewer_error) is not available
+            viewer = program._viewer
             assert (await program.run())["done"]
             steps = [args for tool, args in client.calls if tool == "sim_step"]
-            assert len(steps) == 4
-            assert all(args["realtime"] is available for args in steps)
+            assert len(steps) == (8 if available else 4)
+            assert all("realtime" not in args for args in steps)
+            assert not any(tool.startswith("viewer_") for tool, _ in client.calls)
+        if available:
+            assert viewer.closed
 
     asyncio.run(check())
 
@@ -753,6 +776,8 @@ def test_real_stdio_execution(tmp_path, small_library):
             source, library=small_library, shadows=[], cache=tmp_path / "cache"
         ) as program:
             assert (await program.inspect())["time_s"] == 0
+            assert (await program.inspect())["contact_count"] == 0
+            program._viewer = FakeViewer(program._model)
             assert not (await program.step_into())["enabled_ids"]
             first = await program.step_into()
             before = program.status
@@ -808,5 +833,97 @@ def test_owned_context_preserves_execution_exceptions(tmp_path, small_library):
                 await program.step_over()
         assert caught.value.result["failing_instruction"]["id"] == "0/0"
         assert program.client is None
+
+    asyncio.run(check())
+
+
+def test_execute_inline_faces(build, small_library, tmp_path):
+    faces = (small_library / "parts/cube.dat").read_text()
+    imported = build(
+        f"0 FILE main.ldr\n1 4 0 0 0 {IDENTITY} spring.ldr\n0 FILE spring.ldr\n{faces}",
+        suffix=".mpd",
+        individual_parts=True,
+    )
+    program = Interpreter(imported, output_dir=tmp_path / "execution")
+
+    async def check():
+        await program._load(NativeClient())
+        result = await program.run()
+        assert result["done"]
+        assert result["enabled_ids"] == ["0/inline"]
+        assert [e["kind"] for e in result["events"]] == ["call", "place"]
+        with pytest.raises(ValueError, match="parent assembly"):
+            program.placement_line("0/inline")
+
+    asyncio.run(check())
+
+
+def test_bootstrap_disables_contacts_until_inactive_masks_are_applied(build, tmp_path):
+    imported = build(f"1 4 0 0 0 {IDENTITY} cube.dat\n" * 2, individual_parts=True)
+    imported.spec.option.disableflags = int(mujoco.mjtDisableBit.mjDSBL_WARMSTART)
+    program = Interpreter(imported, output_dir=tmp_path / "execution")
+
+    async def check():
+        client = NativeClient()
+        await program._load(client)
+        assert client.load_contacts == 0
+        assert client.load_disableflags & int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
+        assert client.model.opt.disableflags == int(mujoco.mjtDisableBit.mjDSBL_WARMSTART)
+        assert not client.data.ncon
+        assert [tool for tool, _ in client.calls[:3]] == [
+            "sim_load",
+            "modify_model",
+            "modify_model",
+        ]
+        assert client.calls[2][1]["modifications"][0]["element"] == "option"
+        assert "xml_string" not in client.calls[0][1]
+        original = mujoco.MjModel.from_xml_string(program.xml)
+        np.testing.assert_array_equal(original.body_mass, client.model.body_mass)
+        await program.run()
+        assert client.data.ncon > 0
+        assert (program.output_dir / "bootstrap.xml").exists()
+
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("timestep", [0.001, 0.007])
+def test_browser_chunking_does_not_change_physics(build, timestep):
+    imported = build(PROGRAM, suffix=".mpd", individual_parts=True, timestep=timestep)
+    headless = Interpreter(imported, seconds_per_part=0.113)
+    displayed = Interpreter(imported, seconds_per_part=0.113)
+    displayed._viewer = FakeViewer(displayed._model)
+
+    async def check():
+        a, b = NativeClient(), NativeClient()
+        await headless._load(a)
+        await displayed._load(b)
+        await headless.run()
+        await displayed.run()
+        np.testing.assert_allclose(a.data.qpos, b.data.qpos, atol=1e-12)
+        np.testing.assert_allclose(a.data.qvel, b.data.qvel, atol=1e-12)
+        assert a.data.time == b.data.time
+        await displayed.undo()
+        assert displayed._viewer.frames[-1][1] == []
+        await displayed.reset()
+        assert displayed._viewer.frames[-1][1] == []
+        assert any(frame[2]["status"] == "Running" for frame in displayed._viewer.frames)
+
+    asyncio.run(check())
+
+
+def test_failed_inactive_update_never_restores_contacts(program):
+    async def check():
+        client = NativeClient()
+        client.failure = "modify_model"
+        with pytest.raises(MCPError, match="injected"):
+            await program._load(client)
+        assert client.model.opt.disableflags & int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
+        assert client.load_contacts == 0
+        assert not any(
+            mod.get("element") == "option"
+            for tool, args in client.calls
+            if tool == "modify_model"
+            for mod in args["modifications"]
+        )
 
     asyncio.run(check())

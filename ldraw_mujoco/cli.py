@@ -11,7 +11,7 @@ from pathlib import Path
 import mujoco
 
 from .importer import import_ldraw, inspect_ldraw
-from .simulation import simulate, snapshot
+from .simulation import _simulate, snapshot
 
 
 def write_json(path, report):
@@ -62,7 +62,7 @@ def main(argv=None):
     execute.add_argument("--seconds-per-part", type=float, default=0.1)
     execute.add_argument("--output-dir", type=Path, help="Default: output/INPUT_STEM/execution")
     execute.add_argument(
-        "--viewer", action="store_true", help="Try the server's optional live viewer"
+        "--viewer", action="store_true", help="Open an independent browser inspection viewer"
     )
     run = commands.add_parser("simulate", help="Simulate MJCF and report approximate behavior")
     run.add_argument("input", type=Path)
@@ -70,7 +70,7 @@ def main(argv=None):
     run.add_argument("--report", type=Path, help="Default: INPUT.simulation.json")
     run.add_argument("--snapshot", type=Path, help="Save the final scene as PNG")
     run.add_argument(
-        "--viewer", action="store_true", help="Interactive viewer; use mjpython on macOS"
+        "--viewer", action="store_true", help="Open an independent browser inspection viewer"
     )
     args = parser.parse_args(argv)
     try:
@@ -107,16 +107,25 @@ def main(argv=None):
                 f"{result.report['occurrence_count']} occurrences, {len(result.report['bodies'])} rigid bodies"
             )
         else:
+            from .viewer import browser_session
+
+            print("Loading and compiling XML…", file=sys.stderr)
             model = mujoco.MjModel.from_xml_path(str(args.input.resolve()))
-            data, report = simulate(model, seconds=args.seconds, viewer=args.viewer)
-            report_path = args.report or args.input.with_suffix(".simulation.json")
-            write_json(report_path, report)
-            if args.snapshot:
-                snapshot(model, data, args.snapshot)
-            print(
-                f"Wrote {report_path}: time={data.time:.3f}s, "
-                f"contacts={data.ncon}, numerical warnings={report['warnings']}"
-            )
+            with browser_session(model, enabled=args.viewer) as handle:
+                data, report = _simulate(model, seconds=args.seconds, handle=handle)
+                report_path = args.report or args.input.with_suffix(".simulation.json")
+                write_json(report_path, report)
+                if args.snapshot:
+                    snapshot(model, data, args.snapshot)
+                print(
+                    f"Wrote {report_path}: time={data.time:.3f}s, "
+                    f"contacts={data.ncon}, numerical warnings={report['warnings']}"
+                )
+                if handle is not None and sys.stdin.isatty():
+                    try:
+                        input("Final scene available in the browser. Press Enter to exit. ")
+                    except (EOFError, KeyboardInterrupt):
+                        pass
             return 0 if report["numerically_valid"] else 1
     except (OSError, ValueError, RuntimeError, ExceptionGroup) as exc:
         print(f"ldraw-mujoco: {exc}", file=sys.stderr)

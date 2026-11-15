@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import sys
 import time
 from pathlib import Path
 
@@ -40,6 +41,25 @@ def contacts(model, data):
 
 
 def simulate(model, *, seconds=5.0, data=None, viewer=False):
+    """Simulate with an optional independent browser, closed when this call returns."""
+    from .viewer import browser_session
+
+    with browser_session(model, enabled=viewer) as handle:
+        return _simulate(model, seconds=seconds, data=data, handle=handle)
+
+
+def _display(handle, data, status):
+    if handle is not None:
+        try:
+            handle.publish(data.qpos, status=status)
+        except Exception as exc:
+            print(f"Browser viewer unavailable: {exc}", file=sys.stderr)
+            handle.close()
+            return None
+    return handle
+
+
+def _simulate(model, *, seconds=5.0, data=None, handle=None):
     """Step a model, returning (MjData, report); failures are reported, not hidden.
 
     Duration is rounded up to whole timesteps. Samples are retained every 0.1 s;
@@ -49,6 +69,7 @@ def simulate(model, *, seconds=5.0, data=None, viewer=False):
         raise ValueError("seconds must be finite and positive")
     data = mujoco.MjData(model) if data is None else data
     model.opt.enableflags |= int(mujoco.mjtEnableBit.mjENBL_ENERGY)
+    handle = _display(handle, data, "Loading physics")
     mujoco.mj_forward(model, data)
     initial = _body_states(model, data)
     start = float(data.time)
@@ -59,14 +80,12 @@ def simulate(model, *, seconds=5.0, data=None, viewer=False):
     max_speed = np.zeros(model.nbody - 1)
     max_tilt = np.zeros(model.nbody - 1)
     previous_positions = data.xpos[1:].copy()
-    valid, failures, handle = True, [], None
-    if viewer:
-        from mujoco import viewer as viewer_module
-
-        handle = viewer_module.launch_passive(model, data)
+    valid, failures = True, []
+    wall_start = time.monotonic()
+    frame_stride = max(1, round(0.05 / model.opt.timestep))
     try:
         for step in range(steps):
-            wall_start, before = time.monotonic(), float(data.time)
+            before = float(data.time)
             mujoco.mj_step(model, data)
             completed += 1
             if (
@@ -100,16 +119,13 @@ def simulate(model, *, seconds=5.0, data=None, viewer=False):
                         "bodies": _body_states(model, data),
                     }
                 )
-            if handle is not None:
-                if not handle.is_running():
-                    failures.append("Viewer closed before requested duration")
-                    valid = False
-                    break
-                handle.sync()
-                time.sleep(max(0, model.opt.timestep - (time.monotonic() - wall_start)))
+            if handle is not None and ((step + 1) % frame_stride == 0 or step + 1 == steps):
+                handle = _display(handle, data, "Running")
+                if handle is not None and handle.connected:
+                    target = (step + 1) * model.opt.timestep
+                    time.sleep(max(0, target - (time.monotonic() - wall_start)))
     finally:
-        if handle is not None:
-            handle.close()
+        _display(handle, data, "Finished" if valid else "Stopped: invalid physics")
     warnings = {
         mujoco.mjtWarning(i).name: int(w.number) for i, w in enumerate(data.warning) if w.number
     }

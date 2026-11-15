@@ -306,10 +306,20 @@ def import_ldraw(
         )
     body_names = {g["instance_id"]: g["name"] for g in groups.values()}
     body_names.update({o["id"]: o["body"] for o in occurrence_report})
+    warnings.extend(
+        {
+            "code": "embedded_dat_alias",
+            "reference": reference,
+            "resolved_reference": target,
+            "message": "Missing exact reference resolved to a unique prefixed document-local DAT",
+        }
+        for reference, target in document.reference_aliases.items()
+    )
     report = {
         "source": str(path),
         "source_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         "placement_overrides": document.placement_overrides,
+        "reference_aliases": document.reference_aliases,
         "geometry_dependencies": {
             str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(document.files)
         },

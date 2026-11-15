@@ -193,7 +193,7 @@ return to its field or `c` to cancel and restore the pre-edit line.
 Edits affect **only that occurrence**, even inside a repeated submodel. Original
 files and libraries stay unchanged. The importer rebuilds the scene and evaluates
 the currently enabled parts from their new CAD poses, keeping the instruction
-pointer and enabled IDs. The viewer reopens on the rebuilt scene. Rejected edits
+pointer and enabled IDs. The browser updates to the rebuilt scene while preserving its camera. Rejected edits
 leave the current scene intact. `undo` restores the previous line, geometry and
 poses/velocities. Consecutive edits undo back to the original unedited line;
 undoing does not add another edit. Execution commands and edits share one history,
@@ -216,7 +216,7 @@ async def main():
     async with Interpreter.open(
         "data/models-annotated/106-1.mpd",
         output_dir="output/106-1/python-execution",
-        viewer=True,  # Optional native window with paced physics playback.
+        viewer=True,  # Local browser inspection with paced physics playback.
     ) as program:
         await program.step_into()  # Enter the car submodel.
         result = await program.step_over()  # Place its first DAT part.
@@ -270,27 +270,35 @@ diagnostics in `server.log`, and a flushed `events.jsonl` under
 `output/INPUT_STEM/execution/`; change the directory with `--output-dir`.
 The Python API writes these when `output_dir` is supplied.
 The preparation report includes the XML hash and the exact activation settings.
-XML contains all collision-capable bodies; the interpreter applies the recorded
-initial disabling settings after loading it. Each new session replaces those
+Canonical `scene.xml` contains all collision-capable bodies. The exact
+`bootstrap.xml` loaded by MCP temporarily disables contacts, avoiding an
+all-parts contact solve before the inactive masks are applied. Only after those
+masks succeed does the interpreter restore the original option flags. Both XML
+hashes and the restored flags are recorded in `execution.json`. Each new session replaces those
 artifacts in its output directory; use distinct directories to retain runs.
 
 `--library`, `--shadow` / `--no-shadow`, `--density`, `--friction`, `--timestep`
 and `--clearance` configure import. Execution always covers the full input in
-individual-parts mode. With `--viewer`, each trial plays at approximately real
-time, with viewer updates around 60 times per simulated second. The window
-shows the MCP process's actual model and state: CAD reset, new part placement,
-physics motion, then a pause awaiting the next debugger command. Continue and
-step over/out also show the contained placements. Physics timesteps and trial
-durations are unchanged. The terminal remains the execution controller; use
-the native viewer to rotate, pan and zoom the scene.
+individual-parts mode. With `--viewer`, an independent browser tab shows live
+poses, with orbit, pan, zoom, and a **Frame model** button. Unplaced parts appear
+at their CAD positions at 15% opacity; **Show unplaced parts** toggles this visual
+context. Placed parts retain their original colours/transparency. Physics and
+editing controls remain in the terminal.
 
-The interpreter selects `mjpython` automatically on macOS and handles uv's
-Python library path. Linux and Windows use the ordinary server launcher.
-Closing the window leaves the interpreter usable and removes playback pacing.
-`await program.viewer()` reopens it; on macOS, open the interpreter with
-`viewer=True` so its server has the native launcher. A window-launch failure is
-available as `program.viewer_error`, and the CLI reports it while keeping
-terminal execution available. A local desktop is required for the live window.
+The local Viser service is bound to `127.0.0.1` on an available port. The printed
+URL can be opened manually or revisited after closing the tab. No installed
+viewer app, Node build, CDN, or `mjpython` launcher is needed. The interpreter's
+MCP process runs headlessly and remains the sole physics engine. Browser assets
+come with the pinned Python dependency; no public sharing is enabled.
+
+Connected playback publishes poses about 20 times per simulated second and
+paces against wall time when possible. Timestep, step count, contact settings,
+and trial duration are unchanged. A disconnected browser removes pacing;
+reconnecting receives the current scene. Browser failures leave terminal
+execution available and are recorded in `program.viewer_error` and the event
+log. `await program.viewer()` opens the URL again. Import/compilation, browser
+preparation, and physics loading are reported separately; large models still
+require time to compile, but startup never solves contacts for inactive parts.
 
 ```sh
 # Script a debugger session, or type these commands interactively.
@@ -319,9 +327,16 @@ import structure, not stability assessment or attachment forces. There are no
 constraints between the imported free bodies. Convex collision hulls fill
 cavities and may overlap, so initially assembled bodies can push apart.
 
-On macOS, use `.venv/bin/mjpython -m ldraw_mujoco simulate SCENE.xml --viewer`.
-Elsewhere add `--viewer` to the ordinary command. Offscreen snapshots do not
-require the viewer. Native MuJoCo APIs can edit the returned spec or run physics.
+Add `--viewer` on any platform to open the same independent browser viewer.
+All simulated bodies are active, so this command does not ghost parts or disable
+contacts. The initial picture is published before the first physics solve;
+camera navigation remains independent of that solve. Closing the tab does not
+stop simulation or mark its report invalid.
+
+After the requested duration, the CLI saves its report and optional snapshot,
+then keeps the final scene available until Enter or Ctrl+C. Piped/noninteractive
+runs exit normally. Python `simulate(..., viewer=True)` closes its service when
+it returns. Offscreen snapshots do not require the browser.
 
 - Library: `--library`, then `LDRAW_DIR`, then project-local `data/ldraw`.
 - Shadows: repeat `--shadow`, or set `LDRAW_SHADOW` to paths separated by the
@@ -331,8 +346,14 @@ require the viewer. Native MuJoCo APIs can edit the returned spec or run physics
   1050 kg/m³ and sliding friction 0.6. `--timestep`, `--clearance`, `--density`
   and `--friction` change these uncalibrated assumptions.
 - Each part has detailed colored visual meshes and one convex collision hull.
-  Only hulls contribute mass/inertia. Texture images and inline faces in LDR
-  assemblies are unsupported; use geometry-based patterns or embedded DATs.
+  Only hulls contribute mass/inertia. Inline faces in LDR assemblies are collected
+  into in-memory DAT parts without changing source files. Their IDs end in
+  `inline` (e.g. `0/inline`), leaving source placement IDs unchanged. Each face
+  collection uses one hull and follows the normal grouping mode. It must span
+  a 3D volume. Texture images remain unsupported; use geometry-based patterns.
+- Missing DAT references can resolve to a unique document-local section named
+  `PREFIX - reference.dat`, after exact document and library lookup fail. The
+  import report records these aliases and warnings; ambiguous matches fail.
 - Full source assembly references must resolve for indexing. Geometry is built
   only for selected part occurrences. Shadow metadata is diagnostic, not a
   source of joints or attachment strength.
@@ -343,6 +364,9 @@ require the viewer. Native MuJoCo APIs can edit the returned spec or run physics
 uv run python examples/106-1.py
 uv run pytest -q
 uv run ruff check .
+# Optional browser integration checks (skip when Chromium is not installed):
+uv run playwright install chromium
+uv run pytest -q tests/test_viewer.py
 ```
 
 The example exports the full model, car, minifigure, selected wheel/minifigure,

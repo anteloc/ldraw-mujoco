@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import trimesh
 from ldraw import Colour, Model, Piece, read_model
-from ldraw.errors import PartError
+from ldraw.errors import PartError, PartNotFoundError
 from ldraw.lines import Comment, MetaCommand, Quadrilateral, Triangle
 
 LDU_TO_METERS = 0.0004
@@ -54,6 +54,7 @@ class Document:
             raise ValueError("Input must be an .mpd, .ldr or .dat file")
         self.parts = parts
         self.models = {}
+        self.reference_aliases = {}
         self.origins = {}
         self.files = set()
         self.source_lines = {}
@@ -61,6 +62,8 @@ class Document:
         self.inverted = set()
         self.root = self._read(self.path)
         self._discover(self.root, set())
+        self.inline_pieces = set()
+        self._collect_inline_faces()
         self.available_sections = list(
             dict.fromkeys(
                 m.name
@@ -91,7 +94,11 @@ class Document:
         self.piece_indices = {}
         self._index(self.view, "root", ())
         for ident in self.placement_overrides:
-            if ident not in self.instances or self.instances[ident]["kind"] == "model":
+            if (
+                ident not in self.instances
+                or self.instances[ident]["kind"] == "model"
+                or self.instances[ident].get("generated")
+            ):
                 raise ValueError(f"Edit requires a type-1 occurrence ID: {ident!r}")
         for ident, text in self.placement_overrides.items():
             from .editing import validate_placement
@@ -106,6 +113,9 @@ class Document:
         if key in visiting:
             raise ValueError("Assembly reference cycle: " + " -> ".join((*visiting, key)))
         for index, piece in enumerate(model.pieces):
+            generated = id(piece) in self.inline_pieces
+            if generated:
+                index = "inline"
             self.piece_indices[id(piece)] = index
             instance_id = str(index) if parent == "root" else f"{parent}/{index}"
             child = self.view.submodels.get(normalized(piece.reference))
@@ -128,6 +138,8 @@ class Document:
                 ),
                 "source_text": self.source_lines[source][line - 1] if line else str(piece),
             }
+            if generated:
+                self.instances[instance_id]["generated"] = "inline_faces"
             if child is not None:
                 self._index(child, instance_id, (*visiting, key))
 
@@ -258,17 +270,55 @@ class Document:
             part = self.parts.part(code=normalized(reference).removesuffix(".dat"))
             self.files.add(part.path.resolve())
             return tuple(part.objects)
+        except PartNotFoundError as exc:
+            # Some MPDs namespace their embedded DATs but leave a placement
+            # unqualified. Only recover an absent exact reference, never replace
+            # existing library geometry or hide a malformed part.
+            key = normalized(reference)
+            matches = {
+                id(m): m for m in self.models.values()
+                if key.endswith(".dat") and normalized(m.name).endswith(" - " + key)
+            }
+            if len(matches) > 1:
+                choices = ", ".join(sorted(m.name for m in matches.values()))
+                raise ValueError(
+                    f"Ambiguous embedded DAT for {reference!r}: {choices}"
+                ) from exc
+            if matches:
+                model = next(iter(matches.values()))
+                self.models[key] = model
+                self.reference_aliases[reference] = model.name
+                return model.objects
+            raise ValueError(f"Cannot resolve geometry {reference!r}: {exc}") from exc
         except (PartError, OSError, ValueError) as exc:
             raise ValueError(f"Cannot resolve geometry {reference!r}: {exc}") from exc
 
-    def occurrences(self):
-        for model in self.models.values():
-            if not model.name.casefold().endswith(".dat") and any(
+    def _collect_inline_faces(self):
+        """Wrap parsed assembly surfaces in private DAT leaves; never rewrite sources.
+
+        Keep all non-reference records in order so BFC state and face colours
+        survive. References remain in their original assembly and retain their IDs.
+        """
+        for model in list({id(m): m for m in self.models.values()}.values()):
+            if model.name.casefold().endswith(".dat") or not any(
                 isinstance(obj, (Triangle, Quadrilateral)) for obj in model.objects
             ):
-                raise ValueError(
-                    f"Inline faces in assembly {model.name}; place them in a .dat section"
-                )
+                continue
+            name = f"{model.name}.inline.dat"
+            while normalized(name) in self.models:
+                name = "_" + name
+            inline = Model(
+                name=name,
+                objects=[obj for obj in model.objects if not isinstance(obj, Piece)],
+            )
+            self._register(name, inline, self.origins[id(model)])
+            piece = Piece.place(name, colour=16)
+            self.inline_pieces.add(id(piece))
+            model.objects = [
+                obj for obj in model.objects if not isinstance(obj, (Triangle, Quadrilateral))
+            ] + [piece]
+
+    def occurrences(self):
         try:
             return [
                 self._edited_occurrence(o)

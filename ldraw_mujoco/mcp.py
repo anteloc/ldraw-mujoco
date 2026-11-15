@@ -5,7 +5,6 @@ from __future__ import annotations
 import importlib.metadata
 import json
 import os
-import sys
 import sysconfig
 import tempfile
 from contextlib import asynccontextmanager
@@ -16,17 +15,13 @@ class MCPError(RuntimeError):
     """A transport, tool, or server compatibility failure."""
 
 
-def server_command(*, viewer=False):
-    """Use MuJoCo's native main-thread launcher for graphical macOS sessions."""
+def server_command():
+    """Use the project's pinned, headless server on every platform."""
     scripts = Path(sysconfig.get_path("scripts"))
-    if viewer and sys.platform == "darwin":
-        executable, arguments = scripts / "mjpython", ["-m", "mujoco_mcp"]
-    else:
-        executable = scripts / ("mujoco-mcp.exe" if os.name == "nt" else "mujoco-mcp")
-        arguments = []
+    executable = scripts / ("mujoco-mcp.exe" if os.name == "nt" else "mujoco-mcp")
     if not executable.is_file():
         raise MCPError(f"Server entrypoint missing: {executable}; install the interpreter extra")
-    return str(executable), arguments
+    return str(executable), []
 
 
 def decode_result(result):
@@ -83,7 +78,7 @@ class MujocoClient:
 
     @classmethod
     @asynccontextmanager
-    async def connect(cls, *, log_path=None, viewer=False):
+    async def connect(cls, *, log_path=None):
         try:
             from mcp import ClientSession, StdioServerParameters
             from mcp.client.stdio import stdio_client
@@ -96,20 +91,8 @@ class MujocoClient:
         origin = json.loads(distribution.read_text("direct_url.json") or "{}")
         if origin.get("dir_info", {}).get("editable"):
             raise MCPError("Use the pinned, non-editable interpreter extra, not an editable server")
-        executable, arguments = server_command(viewer=viewer)
-        # The SDK supplies the ordinary process environment allowlist. Pass display
-        # configuration explicitly so an optional viewer can work on desktop hosts.
-        env = {
-            k: v
-            for k, v in os.environ.items()
-            if k in {"DISPLAY", "WAYLAND_DISPLAY", "MUJOCO_GL"} or k.startswith("MUJOCO_MCP_")
-        }
-        if viewer and sys.platform == "darwin":
-            # mjpython's dlopen follows a venv executable symlink. uv's Python
-            # keeps libpython in the base environment, not in that venv's lib/.
-            library_dir = sysconfig.get_config_var("LIBDIR") or str(Path(sys.base_prefix) / "lib")
-            fallback = os.environ.get("DYLD_FALLBACK_LIBRARY_PATH", "/usr/local/lib:/usr/lib")
-            env["DYLD_FALLBACK_LIBRARY_PATH"] = library_dir + ":" + fallback
+        executable, arguments = server_command()
+        env = {"MUJOCO_MCP_NO_RENDER": "1"}
         params = StdioServerParameters(command=executable, args=arguments, env=env)
         if log_path is not None:
             Path(log_path).parent.mkdir(parents=True, exist_ok=True)
@@ -133,12 +116,6 @@ class MujocoClient:
                                     break
                             if missing := cls.required_tools - available.keys():
                                 raise MCPError(f"MuJoCo MCP is missing tools: {sorted(missing)}")
-                            if viewer and "realtime" not in available["sim_step"].inputSchema.get(
-                                "properties", {}
-                            ):
-                                raise MCPError(
-                                    "MuJoCo MCP lacks viewer playback support; update the interpreter extra"
-                                )
                             client = cls(session)
                             diagnostic = await client.call("server_diagnostics")
                             version = diagnostic["version"]["mujoco_version"]
