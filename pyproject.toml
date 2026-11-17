@@ -18,6 +18,7 @@ dependencies = [
     "pillow>=11,<13",
     "networkx>=3,<4",
     "viser==1.1.1",
+    "coacd==1.0.14",
 ]
 
 [project.scripts]

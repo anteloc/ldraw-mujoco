@@ -43,6 +43,11 @@ def main(argv=None):
     convert = commands.add_parser("convert", help="Convert MPD/LDR/DAT to self-contained MJCF")
     convert.add_argument("input", type=Path)
     convert.add_argument("--output", type=Path, required=True)
+    convert.add_argument("--connections", type=Path, help="Source-bound connection JSON; requires --individual-parts")
+    convert.add_argument("--collision", choices=["hull", "decomposed"], default="hull")
+    convert.add_argument("--collision-tolerance", type=float, default=0.00005, help="CoACD concavity threshold in meters")
+    convert.add_argument("--contact-solref", type=float, nargs=2, metavar=("TIMECONST", "DAMPRATIO"))
+    convert.add_argument("--contact-solimp", type=float, nargs=3, metavar=("DMIN", "DMAX", "WIDTH"))
     import_arguments(convert)
     convert.add_argument(
         "--section",
@@ -93,6 +98,11 @@ def main(argv=None):
                 friction=args.friction,
                 timestep=args.timestep,
                 clearance=args.clearance,
+                connections=args.connections,
+                collision=args.collision,
+                collision_tolerance=args.collision_tolerance,
+                contact_solref=args.contact_solref,
+                contact_solimp=args.contact_solimp,
             )
             xml = result.spec.to_xml()
             # Check the artifact the user will actually load, before writing it.

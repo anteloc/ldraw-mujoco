@@ -97,7 +97,7 @@ class Interpreter:
                 mod = {"element": "body", "name": body.name, "field": field}
                 active.append({**mod, "value": enabled})
                 inactive.append({**mod, "value": disabled})
-            for name in [occurrence["collision_geom"], *occurrence["visual_geoms"]]:
+            for name in [*occurrence["collision_geoms"], *occurrence["visual_geoms"]]:
                 self.geom_ids[name] = ident
                 geom = model.geom(name)
                 rgba = geom.rgba.tolist()

@@ -12,6 +12,8 @@ import mujoco
 import numpy as np
 import trimesh
 
+from .collision import decompose
+from .connections import add_bodies, add_constraints, resolve_connections
 from .geometry import (
     BASIS,
     LDU_TO_METERS,
@@ -68,6 +70,11 @@ def import_ldraw(
     timestep: float = 0.001,
     clearance: float = 0.001,
     placement_overrides: dict[str, str] | None = None,
+    connections: str | Path | None = None,
+    collision: str = "hull",
+    collision_tolerance: float = 0.00005,
+    contact_solref: tuple[float, float] | None = None,
+    contact_solimp: tuple[float, float, float] | None = None,
 ) -> ImportedModel:
     """Import MPD/LDR/DAT geometry; all dimensions exposed here are SI units.
 
@@ -82,10 +89,31 @@ def import_ldraw(
     compiled once for validation and is still editable by the caller.
     ``placement_overrides`` maps type-1 occurrence IDs to replacement type-1
     lines. It changes only those occurrences, leaving source files unchanged.
+    ``connections`` is a source-bound JSON specification and requires individual
+    parts. ``collision='decomposed'`` preserves concavities using cached CoACD
+    solids. Connection imports default to stiff contacts and an elliptic cone;
+    their constraints are uncalibrated, permanent attachments, not clutch forces.
     """
     path = Path(path).resolve()
     if not isinstance(individual_parts, bool):
         raise ValueError("individual_parts must be a boolean")
+    if connections is not None and not individual_parts:
+        raise ValueError("connections requires individual_parts=True")
+    if collision not in {"hull", "decomposed"}:
+        raise ValueError("collision must be 'hull' or 'decomposed'")
+    if not np.isfinite(collision_tolerance) or collision_tolerance <= 0:
+        raise ValueError("collision_tolerance must be finite and positive")
+    if contact_solref is None:
+        contact_solref = (0.001, 1) if connections else (0.02, 1)
+    if contact_solimp is None:
+        contact_solimp = (0.95, 0.99, 0.0005) if connections else (0.9, 0.95, 0.001)
+    if (len(contact_solref) != 2 or not np.isfinite(contact_solref).all()
+            or min(contact_solref) <= 0):
+        raise ValueError("contact_solref requires a positive time constant and damping ratio")
+    if (len(contact_solimp) != 3 or not np.isfinite(contact_solimp).all()
+            or not 0 < contact_solimp[0] <= contact_solimp[1] < 1 or contact_solimp[2] <= 0):
+        raise ValueError("contact_solimp requires 0 < dmin <= dmax < 1 and positive width")
+    solimp = [*contact_solimp, 0.5, 2]
     for key, value in {
         "density": density,
         "friction": friction,
@@ -99,9 +127,11 @@ def import_ldraw(
     occurrences = document.occurrences()
     if not occurrences:
         raise ValueError(f"No physical part occurrences in {path}")
+    connection_report = (resolve_connections(document, occurrences, connections)
+                         if connections is not None else None)
     surfaces = Surfaces(document)
     warnings, groups, placements, metadata = [], {}, [], {}
-    if individual_parts:
+    if individual_parts and connections is None:
         warnings.append(
             {
                 "code": "independent_parts",
@@ -170,13 +200,13 @@ def import_ldraw(
                 ]
                 if errors:
                     raise ValueError(f"Incomplete geometry for {occ.reference}: {errors}")
-                connection_report = evidence.connection_metadata
+                metadata_report = evidence.connection_metadata
                 metadata[reference] = {
                     "feature_count": len(evidence.connections),
-                    "coverage": str(connection_report.coverage) if connection_report else "none",
-                    "source_count": connection_report.source_count if connection_report else 0,
-                    "recognized_record_count": connection_report.recognized_record_count
-                    if connection_report
+                    "coverage": str(metadata_report.coverage) if metadata_report else "none",
+                    "source_count": metadata_report.source_count if metadata_report else 0,
+                    "recognized_record_count": metadata_report.recognized_record_count
+                    if metadata_report
                     else 0,
                     "diagnostics": diagnostics,
                 }
@@ -195,6 +225,12 @@ def import_ldraw(
     spec.option.timestep = timestep
     spec.option.gravity = [0, 0, -9.81]
     spec.option.enableflags |= int(mujoco.mjtEnableBit.mjENBL_ENERGY)
+    spec.default.geom.solref = contact_solref
+    spec.default.geom.solimp = solimp
+    if connections:
+        spec.option.cone = mujoco.mjtCone.mjCONE_ELLIPTIC
+        # Native hinge parents must still collide with their mounted wheels.
+        spec.option.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_FILTERPARENT)
     spec.worldbody.add_geom(
         name="ground",
         type=mujoco.mjtGeom.mjGEOM_PLANE,
@@ -204,32 +240,43 @@ def import_ldraw(
         condim=3,
     )
     spec.worldbody.add_light(name="key_light", pos=[0.2, -0.3, 0.6], dir=[-0.2, 0.3, -0.6])
-    for group in groups.values():
-        body = spec.worldbody.add_body(name=group["name"], pos=group["origin"] + offset)
-        body.add_freejoint(name=group["name"] + "_free")
-        group["body"] = body
+    add_bodies(spec, groups, offset, connection_report)
+    if connection_report is not None:
+        add_constraints(spec, groups, connection_report, contact_solref, solimp)
 
     occurrence_report = []
+    decompositions = {}
     for index, (occ, surface, triangles, key) in enumerate(placements):
         group = groups[key]
         local = triangles - group["origin"]
         instance_id = document.occurrence_id(occ)
         prefix = f"part_{instance_id.replace('/', '_')}_{_name(occ.part_code)}"
         try:
-            hull = trimesh.convex.convex_hull(local.reshape(-1, 3))
+            if collision == "hull":
+                hulls = [trimesh.convex.convex_hull(local.reshape(-1, 3))]
+            else:
+                reference = normalized(occ.reference)
+                if reference not in decompositions:
+                    decompositions[reference] = decompose(
+                        surface.triangles, cache=cache, tolerance=collision_tolerance,
+                    )
+                source_hulls, _ = decompositions[reference]
+                transform = np.eye(4)
+                transform[:3, :3] = BASIS @ np.array(occ.matrix.rows)
+                transform[:3, 3] = (BASIS @ vector(occ.position) * LDU_TO_METERS
+                                        - group["origin"])
+                hulls = [h.copy().apply_transform(transform) for h in source_hulls]
         except Exception as exc:
-            raise ValueError(f"Cannot build 3D collision hull for {occ.reference}: {exc}") from exc
-        collision = prefix + "_collision"
-        _add_mesh(spec, collision + "_mesh", hull)
-        group["body"].add_geom(
-            name=collision,
-            type=mujoco.mjtGeom.mjGEOM_MESH,
-            meshname=collision + "_mesh",
-            group=3,
-            density=density,
-            friction=[friction, 0.005, 0.0001],
-            condim=3,
-        )
+            raise ValueError(f"Cannot build {collision} collision geometry for {occ.reference}: {exc}") from exc
+        collision_names = []
+        for number, hull in enumerate(hulls):
+            name = prefix + "_collision" + (f"_{number}" if collision == "decomposed" else "")
+            collision_names.append(name)
+            _add_mesh(spec, name + "_mesh", hull)
+            group["body"].add_geom(
+                name=name, type=mujoco.mjtGeom.mjGEOM_MESH, meshname=name + "_mesh",
+                group=3, density=density, friction=[friction, 0.005, 0.0001], condim=3,
+            )
         colour_groups = {}
         for face_index, colour in enumerate(surface.colours):
             if colour.code == 16:
@@ -282,14 +329,17 @@ def import_ldraw(
                     triangles.min(axis=(0, 1)).tolist(),
                     triangles.max(axis=(0, 1)).tolist(),
                 ],
-                "collision_geom": collision,
+                **({"collision_geom": collision_names[0]} if collision == "hull" else {}),
+                "collision_geoms": collision_names,
                 "visual_geoms": visuals,
-                "estimated_mass_kg": float(hull.volume * density),
+                "estimated_mass_kg": float(sum(h.volume for h in hulls) * density),
             }
         )
 
     # Compile here to fail before a CLI writes a successful-looking artifact.
     model = spec.compile()
+    initial_data = mujoco.MjData(model)
+    mujoco.mj_forward(model, initial_data)
     body_report = []
     for group in groups.values():
         body = model.body(group["name"])
@@ -299,7 +349,7 @@ def import_ldraw(
                 "instance_id": group["instance_id"],
                 "source": group["source"],
                 "occurrence_count": len(group["occurrences"]),
-                "initial_position_m": body.pos.tolist(),
+                "initial_position_m": initial_data.xpos[body.id].tolist(),
                 "estimated_mass_kg": float(body.mass[0]),
                 "inertia_kg_m2": body.inertia.tolist(),
             }
@@ -350,6 +400,11 @@ def import_ldraw(
             "sliding_friction": friction,
             "timestep_s": timestep,
             "ground_clearance_m": clearance,
+            "collision": collision,
+            "collision_tolerance_m": collision_tolerance if collision == "decomposed" else None,
+            "contact_solref": list(contact_solref),
+            "contact_solimp": solimp,
+            "cone": "elliptic" if connections else "pyramidal",
         },
         "coordinate_mapping": "0.0004 * (x, z, -y)",
         "source_bounds_m": bounds.tolist(),
@@ -357,13 +412,20 @@ def import_ldraw(
         "bodies": body_report,
         "occurrences": occurrence_report,
         "connection_metadata": metadata,
+        "attachments": connection_report,
+        "collision_decompositions": {k: v[1] for k, v in decompositions.items()},
         "warnings": warnings,
         "dropped_degenerate_faces": surfaces.dropped_degenerate,
         "assumptions": [
-            "Rigid grouping is user-selected, not inferred from connectors.",
-            "One convex hull per occurrence fills cavities; overlapping hull volumes are counted separately.",
+            ("Confirmed connector evidence and explicit exceptions define permanent attachments."
+             if connections else "Rigid grouping is user-selected, not inferred from connectors."),
+            ("CoACD compound solids approximate cavities; preprocessing error and overlapping volumes are uncalibrated."
+             if collision == "decomposed" else
+             "One convex hull per occurrence fills cavities; overlapping hull volumes are counted separately."),
             "Mass, inertia and friction are uncalibrated estimates; all parts use the selected density.",
             (
+                "Fixed welds and passive hinges approximate attachments; no calibrated clutch release or bearing friction."
+                if connections else
                 "Each physical part is free; there are no welds, clutch forces or articulated connections."
                 if individual_parts
                 else "Each assembly's direct parts are welded; child assemblies remain independent."

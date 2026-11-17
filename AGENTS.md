@@ -39,16 +39,25 @@ physics construction and simulation/reporting separate; no second backend.
   instance. Child submodels are independent world-parented free bodies; never
   weld them to ancestors or siblings. Containers without direct parts have IDs
   but no empty physics body. Root loose parts share the root's own body.
+  This is the legacy default. Opt-in connection specifications with individual
+  parts may add inter-part welds and native hinge parents, preserving CAD poses.
 - `individual_parts=True` / `--individual-parts` is the only grouping switch,
   applied to the entire import. Each physical DAT occurrence gets a free body;
   geometric subparts/primitives stay inside it. Do not restore grouping modes,
-  per-instance overrides, stability workflows or attachment inference.
+  per-instance grouping overrides or stability workflows. The opt-in connection
+  pipeline may use confirmed pyldraw3 evidence and source-bound reviewed
+  exceptions; CAD sections alone never prove an attachment. Hinged parts keep
+  their own bodies but use hinge joints instead of free joints.
 - Keep affine source transforms in mesh vertices. Never turn scale/shear into
   a quaternion silently. Preserve BFC winding and mirrored transforms.
 - Visual surfaces have zero mass and no contacts. Group 3 geoms are collision
-  hulls and the sole source of inferred mass/inertia; group 0 is visual.
+  hulls (single or CoACD compound solids) and the sole source of inferred
+  mass/inertia; group 0 is visual.
 - Hulls fill cavities and can overlap. Density and friction are assumptions.
   Numerical success does not prove attachment strength or real-world stability.
+  Decomposition must be checked for preserved cavities and moving clearances.
+  Only documented permanently fixed mating pairs may exclude contacts; do not
+  suppress wheel/chassis contacts to conceal invalid collision geometry.
 - Shadow coverage/warnings are separate from solid geometry completeness.
   Do not treat inferred connectors as calibrated joints or clutch forces.
 
