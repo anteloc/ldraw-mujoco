@@ -23,6 +23,17 @@ from .geometry import (
 from .library import load_library
 from .meshes import MeshAssets
 
+# MuJoCo's constraint solvers by their MJCF names. Newton suits most scenes; CG
+# scales far better when thousands of touching parts form one contact island.
+SOLVERS = {
+    "newton": mujoco.mjtSolver.mjSOL_NEWTON,
+    "cg": mujoco.mjtSolver.mjSOL_CG,
+    "pgs": mujoco.mjtSolver.mjSOL_PGS,
+}
+# Hull contacts start 0.2 mm before touching. With multiccd, flat mesh faces then
+# keep several contact points, so stacked parts rest instead of sinking into each other.
+CONTACT_MARGIN = 0.0002
+
 
 @dataclass
 class ImportedModel:
@@ -83,6 +94,7 @@ def import_ldraw(
     friction: float = 0.6,
     timestep: float = 0.001,
     clearance: float = 0.001,
+    solver: str = "newton",
 ) -> ImportedModel:
     """Import MPD/LDR/DAT geometry; all dimensions exposed here are SI units.
 
@@ -93,12 +105,16 @@ def import_ldraw(
     Repeated sections require the latter (see ``inspect_ldraw``), and the name
     must match the instance. Bare IDs are not accepted. Selection preserves full-input
     IDs, ancestor transforms and colors; overlapping selections form a union.
-    ``shadows=[]`` disables external connector metadata. The returned spec is
-    compiled once into ``result.model``. Recompile after editing the spec.
+    ``shadows=[]`` disables external connector metadata. ``solver`` is one of
+    ``SOLVERS``; use ``"cg"`` for thousands of touching individual parts. The
+    returned spec is compiled once into ``result.model``. Recompile after editing
+    the spec.
     """
     path = Path(path).resolve()
     if not isinstance(individual_parts, bool):
         raise ValueError("individual_parts must be a boolean")
+    if solver not in SOLVERS:
+        raise ValueError(f"Invalid solver: {solver!r}; use one of {', '.join(SOLVERS)}")
     for key, value in {
         "density": density,
         "friction": friction,
@@ -118,7 +134,10 @@ def import_ldraw(
     spec.compiler.inertiagrouprange = [3, 3]  # Only collision hulls contribute inertia.
     spec.option.timestep = timestep
     spec.option.gravity = [0, 0, -9.81]
+    spec.option.solver = SOLVERS[solver]
     spec.option.enableflags |= int(mujoco.mjtEnableBit.mjENBL_ENERGY)
+    # Multi-point convex contacts: one point per mesh pair cannot hold a stack.
+    spec.option.enableflags |= int(mujoco.mjtEnableBit.mjENBL_MULTICCD)
     spec.worldbody.add_geom(
         name="ground",
         type=mujoco.mjtGeom.mjGEOM_PLANE,
@@ -135,8 +154,9 @@ def import_ldraw(
         warnings.append(
             {
                 "code": "independent_parts",
-                "message": "Parts have independent free joints and no attachment constraints. "
-                "Convex hulls of assembled parts can overlap and push each other apart.",
+                "message": "Parts have independent free joints and no attachment constraints, "
+                "so parts held only by studs fall. Hulls without studs can still overlap "
+                "where parts interpenetrate in CAD and push each other apart.",
             }
         )
     low, high = np.full(3, np.inf), np.full(3, -np.inf)
@@ -173,7 +193,7 @@ def import_ldraw(
         quat = np.empty(4)
         mujoco.mju_mat2Quat(quat, rotation.ravel())
         position_m = BASIS @ position * LDU_TO_METERS
-        vertices = meshes.hull_vertices @ rotation.T + position_m
+        vertices = meshes.bounds_points @ rotation.T + position_m
         bounds = np.array([vertices.min(axis=0), vertices.max(axis=0)])
         low, high = np.minimum(low, bounds[0]), np.maximum(high, bounds[1])
 
@@ -207,6 +227,7 @@ def import_ldraw(
             density=density,
             friction=[friction, 0.005, 0.0001],
             condim=3,
+            margin=CONTACT_MARGIN,
         )
         visuals = []
         for number, (meshname, face_colour) in enumerate(meshes.visuals[reverse]):
@@ -320,6 +341,8 @@ def import_ldraw(
             "sliding_friction": friction,
             "timestep_s": timestep,
             "ground_clearance_m": clearance,
+            "solver": solver,
+            "contact_margin_m": CONTACT_MARGIN,
         },
         "coordinate_mapping": "0.0004 * (x, z, -y)",
         "source_bounds_m": [low.tolist(), high.tolist()],
@@ -331,7 +354,9 @@ def import_ldraw(
         "dropped_degenerate_faces": assets.surfaces.dropped_degenerate,
         "assumptions": [
             "Rigid grouping is user-selected, not inferred from connectors.",
-            "One convex hull per occurrence fills cavities; overlapping hull volumes are counted separately.",
+            "One convex hull per occurrence, without studs, fills cavities; overlapping hull volumes are counted separately.",
+            "Studs are visual only: no lateral interlock or clutch, in any orientation (including SNOT).",
+            "Hull contacts use multi-point collision (multiccd) and start within the contact margin.",
             "Mass, inertia and friction are uncalibrated estimates; all parts use the selected density.",
             (
                 "Each physical part is free; there are no welds, clutch forces or articulated connections."

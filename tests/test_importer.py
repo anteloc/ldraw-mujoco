@@ -14,11 +14,12 @@ from ldraw_mujoco.library import load_library
 IDENTITY = "1 0 0 0 1 0 0 0 1"
 
 
-def collision_points(model):
+def collision_points(model, group=3):
+    """World vertices of the meshes in a geom group: 3 for hulls, 0 for visuals."""
     data = mujoco.MjData(model)
     mujoco.mj_forward(model, data)
     points = []
-    for gid in np.flatnonzero(model.geom_group == 3):
+    for gid in np.flatnonzero((model.geom_group == group) & (model.geom_bodyid != 0)):
         mesh = model.geom_dataid[gid]
         start = model.mesh_vertadr[mesh]
         vertices = model.mesh_vert[start : start + model.mesh_vertnum[mesh]]
@@ -92,6 +93,34 @@ def test_planar_colour_patch_and_transparency(build, small_library):
     assert np.all(model.geom_contype[visuals] == 0)
     # Patches do not add mass to the solid hull.
     assert model.body_mass[1] == pytest.approx(20 * 8 * 20 * LDU_TO_METERS**3 * 1050)
+
+
+def test_studs_are_visual_only(build):
+    result = build(f"1 4 0 0 0 {IDENTITY} brick.dat\n", clearance=0)
+    model = result.model
+    # The hull stops at the cube top; the 4 LDU stud stays in visuals and bounds.
+    assert collision_points(model)[:, 2].max() == pytest.approx(8 * LDU_TO_METERS)
+    assert collision_points(model, group=0)[:, 2].max() == pytest.approx(12 * LDU_TO_METERS)
+    bounds = np.array(result.report["source_bounds_m"])
+    assert bounds[1, 2] - bounds[0, 2] == pytest.approx(12 * LDU_TO_METERS)
+    assert model.body_mass[1] == pytest.approx(20 * 8 * 20 * LDU_TO_METERS**3 * 1050)
+    # A part made only of a stud keeps it as its hull.
+    knob = build(f"1 4 0 0 0 {IDENTITY} knob.dat\n").model
+    assert knob.body_mass[1] == pytest.approx(12 * 4 * 12 * LDU_TO_METERS**3 * 1050)
+
+
+def test_solver_and_contact_options_round_trip(build):
+    placement = f"1 4 0 0 0 {IDENTITY} cube.dat\n"
+    assert build(placement).model.opt.solver == mujoco.mjtSolver.mjSOL_NEWTON
+    result = build(placement, solver="cg")
+    assert result.report["options"]["solver"] == "cg"
+    assert result.report["options"]["contact_margin_m"] == 0.0002
+    for model in (result.model, mujoco.MjModel.from_xml_string(result.spec.to_xml())):
+        assert model.opt.solver == mujoco.mjtSolver.mjSOL_CG
+        assert model.opt.enableflags & int(mujoco.mjtEnableBit.mjENBL_MULTICCD)
+        np.testing.assert_allclose(model.geom_margin[model.geom_group == 3], 0.0002)
+    with pytest.raises(ValueError, match="solver"):
+        build(placement, solver="fast")
 
 
 def test_bfc_winding_and_mirror(tmp_path, small_library):

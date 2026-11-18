@@ -43,8 +43,21 @@ length scale of 0.0004 m/LDU.
 
 Each shape has one trimesh convex hull. Every occurrence references it from
 a group 3 geom, contributing its own contacts, mass, and inertia. Winding
-variants share the same hull. Transforming just its extreme vertices gives
-the bounds of the placed surface and the common ground offset.
+variants share the same hull.
+
+The hull leaves out faces reached through stud primitives, following
+pyldraw3's own rule (a referenced file stem starting with `stud`). A filled
+hull cannot receive a stud, so a stud would start 1.6 mm inside the part above
+and push it away. Without studs, stacked parts start face to face. Visual
+meshes keep their studs. The extreme points of the full surface, studs
+included, give the placed bounds and the common ground offset.
+
+Hull geoms have a 0.2 mm contact margin, and the scene enables MuJoCo's
+multi-point convex collision (`multiccd`). With one contact point per mesh
+pair (MuJoCo's default), a five-high stack of mesh boxes telescoped 39 mm in
+1 s, while the same boxes as primitives sank 3 mm. With `multiccd` and the
+margin, the mesh stack sank 1.45 mm. The importer's `solver` option (default
+`newton`) sets MuJoCo's constraint solver.
 
 Visual meshes group faces by their source color, keeping inherited color 16
 as a separate group for per-geom RGBA. Placement-path BFC inversion selects
@@ -113,6 +126,81 @@ Group origins use the containing section's composed origin (or the part origin
 in individual-parts mode). One shared offset brings the lowest selected point
 to the requested ground clearance, preserving relative source placements.
 
+## Hold check and performance
+
+The goal is one evaluation right after import: if a model holds still for a
+set time (default 5 s), treat it as not crumbling. Viewing is separate and
+never runs physics.
+
+`hold(model, seconds=5, tolerance=0.002, settle=0.2)` (CLI: `hold`) works in
+three steps:
+
+1. It steps through the settle window. The displacement there is reported as
+   `settle_displacement_m` and `settle_body`, but not judged.
+2. It takes the settled pose as the reference. Every 10 ms of simulated time,
+   it measures each body's largest displacement of any corner of its colliding
+   geoms' bounding boxes (`geom_aabb`), so rotations count.
+3. It stops at the first body beyond the tolerance, or after `seconds`.
+
+`show(model, data, highlight=...)` opens `mujoco.viewer.launch_passive` on the
+result, frames the whole model and tints moved bodies red. It never steps.
+
+Measurements on a 2,175-part garden (MuJoCo 3.5.0, Apple silicon) explain the
+design. They were taken with the importer as it was before this change.
+
+| Individual parts, before | Measured |
+|---|---|
+| Bodies, DoFs | 2,175 free bodies, nv 13,050 |
+| Contacts at t=0 | 8,119 contacts, 32,476 constraint rows, one island |
+| Hull overlap at t=0 | max 11.2 mm; 2,606 contacts deeper than 0.1 mm |
+| `mj_step` with Newton | 6–17 s; 99.9 % in the constraint solver, 16 ms collision |
+| `mj_step` with CG | 62–130 ms, always at the 100-iteration cap |
+| Rendering, 1280×720 | 1.79 M triangles: 38 ms per frame with shadows, 22 ms without |
+
+- **The viewer ran physics.** `mujoco.viewer.launch` steps in real time and,
+  even when paused, calls `mj_forward` about every 1 ms under the lock its
+  render thread needs. No frame can be faster than one physics call.
+- **Newton on one giant island.** Overlapping hulls linked every part into one
+  13,050-DoF island, and Newton refactorizes its Hessian each iteration. CG is
+  about 150× faster there. Newton is faster for small or loosely connected
+  scenes (41 welded bodies: 2.8 vs 5.1 ms per step; 2,500 separate bricks: 7 vs
+  12 ms). The island size depends on contacts, not on nv, so the solver is an
+  explicit option, not an automatic rule.
+- **Nothing came to rest.** Single-point mesh contacts, stud overlaps and the
+  lack of clutch made every part move more than 1 mm within 50 ms. A scene
+  that never settles never becomes cheaper to step.
+- **`simulate()` doubled the cost** with a second `mj_forward` after each step.
+  It now reads positions one step late, refreshes them once at the end, and
+  syncs a viewer at most 60 times per second.
+
+Results after this change, for the same garden (wall time of the check after
+XML loading):
+
+| Scene | Verdict | Wall time |
+|---|---|---|
+| Welded, 41 bodies, Newton | crumbles: unattached bamboo stalk moved 3.2 mm right after settling | 3.8 s |
+| Individual parts, CG | crumbles: 476 parts beyond 2 mm 10 ms after settling (no clutch) | 38.9 s |
+
+Multi-point contacts raise the individual-parts scene to about 35,000
+contacts in 91 islands. CG then needs 0.35–0.41 s per step at the start, and
+Newton still needs 13–39 s, so `--solver cg` remains necessary there.
+
+Why settle first: from the import pose, the 1 mm clearance drop plus
+soft-contact tilt of large bodies moved 29 of 41 welded bodies more than 2 mm
+by t=0.03 s. After 0.2 s of settling, the median body moved 0.6 mm in the next
+3 s, and only bodies that really toppled exceeded 2 mm. The cost is that a
+part which falls and comes to rest inside the window is not judged. `settle=0`
+gives the strict check.
+
+Deferred:
+
+- **Sleep** (`mjENBL_SLEEP`). A resting body that falls asleep makes steps 27×
+  cheaper. But a resting brick keeps jittering at about 5e-4 rad/s, above
+  MuJoCo's 1e-4 default sleep tolerance, so it never sleeps. A tolerance of
+  1e-3 lets it sleep after 0.15 s, but could freeze parts that are about to tip.
+- **Lighter rendering.** Turning off shadows or showing only hulls cuts the
+  frame time to 22 or 7 ms; the viewer's Rendering panel already offers both.
+
 ## Verification and reproduction
 
 106-1 has 65 physical occurrences across 36 part references. Default import
@@ -128,18 +216,21 @@ uv run pytest -q --junitxml=output/106-1/tests.xml
 uv run ruff check .
 ```
 
-The example writes portable scenes, import reports, an inventory and initial
-views. The report records input/dependency hashes, versions, attribution, IDs,
-body/geom mappings, assumptions and shadow diagnostics. Inspect whole and
-selected scenes when geometry/body boundaries change.
+The example writes portable scenes, import reports, an inventory, initial
+views and a `.hold.json` check for each scene. The import report records
+input/dependency hashes, versions, attribution, IDs, body/geom mappings,
+options, assumptions and shadow diagnostics. Inspect whole and selected scenes
+when geometry/body boundaries change.
 
 Tests cover placement-path IDs, repeated ancestors, ambiguity and name/ID mismatch errors, unique
 names, multiple/overlapping selections, inherited transforms/colors, independent
 child bodies, primitive/embedded DAT boundaries, standalone inputs, winding,
-planar color patches, and missing/cyclic references. Integration tests verify
-sample counts, positive mass/inertia and XML round trips. Existing generic
-simulation checks remain; there is no requirement to keep assemblies upright
-or attached, and no stability decision is produced.
+planar color patches, missing/cyclic references, stud-free hulls with studded
+visuals, and the solver, multiccd and margin options in the XML round trip.
+Hold tests cover a resting part, a falling part with and without settling, a
+tipping body, invalid arguments and the CLI exit code. Integration tests verify
+sample counts, positive mass/inertia, XML round trips and that the sample gets
+a valid verdict. They do not require the sample to hold.
 
 MuJoCo rounds inline XML numbers. Round-trip tests compare geometry to 0.1
 micrometer, mass/inertia within serialization tolerances, and free-flight
@@ -152,7 +243,8 @@ world geometry rather than those internal frames.
 For MCP verification, validate and load the XML, inspect `scene_map` and the
 free joints, and step briefly to confirm the artifact runs. The local renderer
 supplies inspection images when MCP rendering is unavailable. MCP is optional
-for ordinary package use. No stability analysis is required for this increment.
+for ordinary package use. Use `hold` for the verdict, not the MCP stability
+tools: its tolerance, settle window and report are the project's convention.
 
 ## Lessons retained and next steps
 
@@ -174,8 +266,25 @@ check in a fresh process. Its timing covers source loading through native model
 compilation. Peak resident memory includes constructing the data and taking one
 step with spaced bricks. Dense contact workloads need separate measurements.
 
-Keep the single parts/welded flag for future changes. Mixed per-instance modes, support contexts, stability verdicts,
-attachments and articulated mechanisms are deferred until explicitly requested.
+Keep the single parts/welded flag for future changes. Mixed per-instance
+modes, support contexts, attachments and articulated mechanisms are deferred
+until explicitly requested.
+
+The next step for meaningful verdicts is clutch. In real LEGO, a stud holds
+only inside a hollow receptacle (shear interlock) plus clutch, in any
+orientation, including SNOT side studs. A filled convex hull has no hollow, so
+studs cannot be represented there. Two options, to be decided before work
+starts:
+
+- Constraints between parts that pyldraw3's connection graph says are
+  connected. The graph already detects top and side studs with their frames.
+  This reverses the "no attachment inference" rule.
+- Convex decomposition with hollow receptacles. This gives geometric interlock
+  without inference, but adds a dependency and many more contacts.
+
+Calibrating contacts (stiffer `solref`, zero clearance) belongs with either
+option, so that settling stays well below the tolerance and the settle window
+can shrink.
 
 The ID convention comes from Carlos Antelo's
 [ldraw-mecha](https://github.com/anteloc/ldraw-mecha) documentation (2026,

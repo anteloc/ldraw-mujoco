@@ -14,8 +14,10 @@ physical modeling decision cannot be resolved from the task and evidence.
 4. `uv run ruff check .` checks maintained code. Source data is excluded.
 
 Use `ldraw_mujoco.import_ldraw()` or the `ldraw-mujoco convert` command to build
-models. Use native MuJoCo APIs after compilation. Keep parsing/geometry,
-physics construction and simulation/reporting separate; no second backend.
+models, and `hold()` or `ldraw-mujoco hold` to check them once, headless. View
+results with `show()` or `--viewer`, which never step physics. Use native
+MuJoCo APIs after compilation. Keep parsing/geometry, physics construction and
+simulation/reporting separate; no second backend.
 
 ## Conventions that must stay explicit
 
@@ -41,14 +43,23 @@ physics construction and simulation/reporting separate; no second backend.
   but no empty physics body. Root loose parts share the root's own body.
 - `individual_parts=True` / `--individual-parts` is the only grouping switch,
   applied to the entire import. Each physical DAT occurrence gets a free body;
-  geometric subparts/primitives stay inside it. Do not restore grouping modes,
-  per-instance overrides, stability workflows or attachment inference.
+  geometric subparts/primitives stay inside it. Do not restore grouping modes
+  or per-instance overrides. Do not add attachment inference until approved.
+- The hold check is the one stability workflow: settle (0.2 s), then stop at
+  the first body that moves beyond the tolerance (2 mm) within the duration
+  (5 s). Run it once, headless. Never step large scenes in
+  `mujoco.viewer.launch`: it runs physics continuously, even when paused.
+  `--solver cg` suits thousands of touching individual parts; Newton the rest.
 - Keep affine source transforms in mesh vertices. Never turn scale/shear into
   a quaternion silently. Preserve BFC winding and mirrored transforms.
 - Visual surfaces have zero mass and no contacts. Group 3 geoms are collision
   hulls and the sole source of inferred mass/inertia; group 0 is visual.
-- Hulls fill cavities and can overlap. Density and friction are assumptions.
-  Numerical success does not prove attachment strength or real-world stability.
+- Hulls omit stud primitives (pyldraw3's `stud` file-stem rule) and fill
+  cavities; CAD interpenetrations (pins, clips, minifig joints) can still
+  overlap. Hull contacts use multiccd and a 0.2 mm margin so flat faces rest on
+  each other. Density, friction and the margin are assumptions. Studs give no
+  interlock or clutch in any orientation, SNOT included. Numerical success
+  does not prove attachment strength or real-world stability.
 - Shadow coverage/warnings are separate from solid geometry completeness.
   Do not treat inferred connectors as calibrated joints or clutch forces.
 

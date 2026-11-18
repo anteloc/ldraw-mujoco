@@ -15,38 +15,47 @@ without modifying source files. No downloads occur during import.
 uv sync --locked
 ```
 
-In Python, open the complete model with one independent rigid body per placed DAT.
-The importer resolves geometry and library connectors, builds an editable
-`MjSpec`, and compiles it once in memory.
+In Python, import the complete model, check once that it holds still, then look
+at the result. The importer resolves geometry and library connectors, builds an
+editable `MjSpec`, and compiles it once in memory.
 
 ```python
-import mujoco
-import mujoco.viewer
-
 from ldraw_mujoco import import_ldraw
+from ldraw_mujoco.simulation import hold, show
 
-result = import_ldraw("data/models-annotated/106-1.mpd", individual_parts=True)
-model = result.model
-data = mujoco.MjData(model)
-mujoco.viewer.launch(model, data)
+result = import_ldraw("data/models-annotated/106-1.mpd")
+data, report = hold(result.model, seconds=5)
+moved = [body["name"] for body in report["moved_bodies"]]
+print("holds" if report["holds"] else f"crumbles: {moved}")
+show(result.model, data, highlight=moved)  # Static view; moved bodies in red.
 ```
 
-For a headless simulation, call `mujoco.mj_step(model, data)` directly. After
+`hold` steps the physics once, headless and as fast as possible, and stops as
+soon as the verdict is known. `show` opens MuJoCo's viewer on that result
+without stepping, so it stays responsive with thousands of parts. On macOS,
+run such scripts with `mjpython` (see [the viewer notes](#optional-simulation-and-configuration)).
+`mujoco.viewer.launch(model)` instead runs physics continuously, even while
+paused: fine for 106-1, unusable for thousands of touching parts.
+
+For your own headless loop, call `mujoco.mj_step(model, data)` directly. After
 editing `result.spec`, call `result.spec.compile()` to obtain a new model and
 create matching `MjData`. Use `result.spec.to_xml()` for a portable scene.
 
-To list instance IDs or export from the command line, run
+To list instance IDs, export, and check the exported scene from the command line, run
 
 ```sh
 uv run ldraw-mujoco inspect data/models-annotated/106-1.mpd
 uv run ldraw-mujoco convert data/models-annotated/106-1.mpd \
   --output output/106-1/scene.xml
+uv run ldraw-mujoco hold output/106-1/scene.xml --snapshot output/106-1/held.png
 ```
 
 `inspect` prints a JSON inventory of all placed parts and submodels, including
 IDs, parent IDs and source lines. It needs the source model and its external
 submodel files, but no parts library or mesh compilation. `convert` writes
 portable XML with inline meshes and a neighboring `.import.json` report.
+`hold` writes `scene.hold.json` and exits with 0 when the scene holds, 1 when
+it does not (see [Hold check](#hold-check)).
 
 ## IDs and selecting instances
 
@@ -159,6 +168,37 @@ adds part IDs, transforms and geom names; `bodies` maps each body to its owning
 `instance_id`. `selected_instances` records the resolved IDs (such as `0/46`). Names of
 bodies/geoms derive from full-input IDs, so selection does not renumber them.
 
+## Hold check
+
+A model **holds** when, after a short settling window, no body moves more than
+the tolerance for the whole duration. Run it once, right after importing:
+
+```sh
+uv run ldraw-mujoco hold SCENE.xml --seconds 5 --tolerance 0.002 --settle 0.2
+```
+
+- Movement is the largest displacement of any corner of a body's collision
+  bounding boxes, checked every 10 ms of simulated time. Rotations count.
+- The check stops at the first body beyond the tolerance (it crumbles), so a
+  failing model answers quickly. A holding model runs the full duration.
+- The first `--settle` seconds are reported but not judged. Contacts are soft:
+  the scene drops its 1 mm import clearance and sinks into its contacts, which
+  alone can move large bodies about 2 mm. A part that falls and comes to rest
+  inside this window is not judged; `settle_displacement_m` and `settle_body`
+  show it. `--settle 0` checks strictly from the import pose.
+- The report lists `moved_bodies` by name and displacement. `--viewer` then
+  shows the result with those bodies in red, and `--snapshot` saves it as PNG.
+
+A verdict reflects the approximations below. There is no clutch and studs are
+visual only, so parts held by studs, including SNOT parts, fall in
+individual-parts mode. In the default mode, submodels resting on other
+submodels can topple. "Holds" is therefore not proof of real-world stability.
+
+Measured on a 2,175-part garden: the welded import (41 bodies) answers in 4 s,
+and individual parts with `--solver cg` in 39 s. With the default Newton
+solver, one step of the individual-parts scene takes 13–39 s. See
+[architecture notes](docs/architecture.md#hold-check-and-performance).
+
 ## Optional simulation and configuration
 
 ```sh
@@ -166,15 +206,23 @@ uv run ldraw-mujoco simulate output/106-1/scene.xml --seconds 1 \
   --snapshot output/106-1/simulated.png
 ```
 
-`simulate` writes motion, contacts, energy and numerical warnings to
-`.simulation.json`. Falling or detachment is allowed: this iteration concerns
-import structure, not stability assessment or attachment forces. There are no
-constraints between the imported free bodies. Convex collision hulls fill
-cavities and may overlap, so initially assembled bodies can push apart.
+`simulate` runs the full duration and writes motion, contacts, energy and
+numerical warnings to `.simulation.json`, without a verdict. There are no
+constraints between the imported free bodies.
 
-On macOS, use `.venv/bin/mjpython -m ldraw_mujoco simulate SCENE.xml --viewer`.
+On macOS, viewers need `mjpython`, for example
+`.venv/bin/mjpython -m ldraw_mujoco hold SCENE.xml --viewer`. With a
+uv-managed Python, `mjpython` cannot find `libpython` unless you point it at the
+interpreter's library folder:
+
+```sh
+export DYLD_FALLBACK_LIBRARY_PATH="$(.venv/bin/python -c 'import sys; print(sys.base_prefix)')/lib:/usr/local/lib:/usr/lib"
+```
+
 Elsewhere add `--viewer` to the ordinary command. Offscreen snapshots do not
-require the viewer. Native MuJoCo APIs can edit the returned spec or run physics.
+require the viewer. For very large scenes, turning off shadows in the viewer's
+Rendering panel makes each frame about 40 % cheaper. Native MuJoCo APIs can
+edit the returned spec or run physics.
 
 - Library: `--library`, then `LDRAW_DIR`, then project-local `data/ldraw`.
 - Shadows: repeat `--shadow`, or set `LDRAW_SHADOW` to paths separated by the
@@ -183,7 +231,15 @@ require the viewer. Native MuJoCo APIs can edit the returned spec or run physics
 - Defaults: timestep 1 ms, gravity −9.81 m/s², clearance 1 mm, density
   1050 kg/m³ and sliding friction 0.6. `--timestep`, `--clearance`, `--density`
   and `--friction` change these uncalibrated assumptions.
+- Solver: Newton (MuJoCo's default) by default. Use `--solver cg` (Python:
+  `solver="cg"`) for thousands of touching individual parts. They form a huge
+  contact island, where Newton needs 13–39 s per step and CG under 0.5 s.
+  Newton stays faster for welded or loosely connected scenes.
 - Each part has detailed colored visual meshes and one convex collision hull.
+  Hulls leave out stud primitives (pyldraw3's `stud*` rule), so stacked parts
+  start face to face instead of overlapping by a stud height. Hull contacts use
+  MuJoCo multi-point collision (`multiccd`) with a 0.2 mm margin. With a single
+  contact point per pair, stacked meshes sink into each other.
   Only hulls contribute mass/inertia. Texture images and inline faces in LDR
   assemblies are unsupported; use geometry-based patterns or embedded DATs.
 - Full source assembly references must resolve for indexing. Geometry is built
@@ -199,8 +255,8 @@ uv run ruff check .
 ```
 
 The example exports the full model, car, minifigure, selected wheel/minifigure,
-and individual-parts variants, with inventories, reports and initial images
-under `output/106-1/`. See [architecture notes](docs/architecture.md) for the
+and individual-parts variants, with inventories, reports, initial images and
+hold checks under `output/106-1/`. See [architecture notes](docs/architecture.md) for the
 conventions, tests and continuation guidance.
 
 To reproduce the 10,000-body acceptance run on macOS or Linux, run

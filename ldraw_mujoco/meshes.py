@@ -10,10 +10,18 @@ from ldraw import Colour
 from .geometry import BASIS, LDU_TO_METERS, Surfaces, triangle_mesh
 
 
+def _hull(triangles, reference):
+    try:
+        return trimesh.convex.convex_hull(triangles.reshape(-1, 3))
+    except Exception as exc:
+        raise ValueError(f"Cannot build 3D collision hull for {reference}: {exc}") from exc
+
+
 @dataclass
 class PartMeshes:
     collision: str
-    hull_vertices: np.ndarray
+    # Extreme points of the full surface, studs included, for bounds and clearance.
+    bounds_points: np.ndarray
     volume: float
     # BFC inversion changes only the winding of the visual faces.
     visuals: dict[bool, list[tuple[str, Colour]]] = field(default_factory=dict)
@@ -45,13 +53,14 @@ class MeshAssets:
             raise ValueError(f"No surface geometry for {reference}")
         triangles = surface.triangles @ (BASIS @ bake).T * LDU_TO_METERS
         if assets is None:
-            try:
-                hull = trimesh.convex.convex_hull(triangles.reshape(-1, 3))
-            except Exception as exc:
-                raise ValueError(f"Cannot build 3D collision hull for {reference}: {exc}") from exc
+            # A stud would start inside the filled hull of the part above and push it
+            # away, so hulls skip studs; visual meshes keep them.
+            solid = triangles if surface.studs.all() else triangles[~surface.studs]
+            hull = _hull(solid, reference)
             name = f"mesh_{len(self.cache)}_hull"
             self._add(name, hull, mujoco.mjtMeshInertia.mjMESH_INERTIA_CONVEX)
-            assets = PartMeshes(name, np.asarray(hull.vertices), float(hull.volume))
+            outline = hull if len(solid) == len(triangles) else _hull(triangles, reference)
+            assets = PartMeshes(name, np.asarray(outline.vertices), float(hull.volume))
             self.cache[key] = assets
 
         groups = {}

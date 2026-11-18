@@ -1,4 +1,4 @@
-"""Export full and selected instances, in both modes, with initial inspection views.
+"""Export full and selected instances, in both modes, with initial views and hold checks.
 
 Run with: uv run python examples/106-1.py
 """
@@ -9,7 +9,7 @@ import mujoco
 
 from ldraw_mujoco import import_ldraw, inspect_ldraw
 from ldraw_mujoco.cli import write_json
-from ldraw_mujoco.simulation import snapshot
+from ldraw_mujoco.simulation import hold, snapshot
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "output/106-1"
@@ -38,7 +38,11 @@ def main():
         data = mujoco.MjData(model)
         image = "initial.png" if name == "scene" else f"{name}.png"
         snapshot(model, data, OUTPUT / image)
-        print(f"{name}: {result.report['occurrence_count']} parts, {model.nbody - 1} bodies")
+        # Check once, on fresh state, that the exported scene holds still.
+        _, check = hold(model)
+        write_json(OUTPUT / f"{name}.hold.json", check)
+        verdict = "holds" if check["holds"] else f"{len(check['moved_bodies'])} bodies moved"
+        print(f"{name}: {result.report['occurrence_count']} parts, {model.nbody - 1} bodies, {verdict}")
     print(f"Artifacts: {OUTPUT}")
 
 

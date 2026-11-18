@@ -25,6 +25,11 @@ def vector(v):
     return np.array([v.x, v.y, v.z], dtype=float)
 
 
+def is_stud(reference):
+    """pyldraw3's rule (part_geometry._STUD_PREFIX): a file stem starting with "stud"."""
+    return Path(normalized(reference)).name.startswith("stud")
+
+
 def check_transform(matrix, position, context):
     if not np.isfinite(matrix).all() or not np.isfinite(position).all():
         raise ValueError(f"Non-finite transform in {context}")
@@ -256,6 +261,8 @@ class Document:
 class Surface:
     triangles: np.ndarray
     colours: tuple[Colour, ...]
+    # True for faces reached through a stud primitive; collision hulls skip them.
+    studs: np.ndarray
 
 
 class Surfaces:
@@ -273,7 +280,7 @@ class Surfaces:
         if key in self.cache:
             return self.cache[key]
         objects = self.document.objects(reference)
-        triangles, colours = [], []
+        triangles, colours, studs = [], [], []
         inverted = inverted_pieces(objects)
         clockwise = False
         for obj in objects:
@@ -298,6 +305,7 @@ class Surfaces:
                         continue
                     triangles.append(tri[::-1] if clockwise else tri)
                     colours.append(obj.colour)
+                    studs.append(False)
             elif isinstance(obj, Piece):
                 child = self.get(obj.reference, (*visiting, key))
                 matrix, position = np.array(obj.matrix.rows), vector(obj.position)
@@ -307,7 +315,10 @@ class Surfaces:
                     transformed = transformed[:, ::-1]
                 triangles.extend(transformed)
                 colours.extend(obj.colour if c.code == 16 else c for c in child.colours)
-        surface = Surface(np.array(triangles).reshape(-1, 3, 3), tuple(colours))
+                studs.extend([True] * len(child.studs) if is_stud(obj.reference) else child.studs)
+        surface = Surface(
+            np.array(triangles).reshape(-1, 3, 3), tuple(colours), np.array(studs, dtype=bool)
+        )
         self.cache[key] = surface
         return surface
 

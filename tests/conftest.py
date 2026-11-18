@@ -6,6 +6,16 @@ import trimesh
 from ldraw_mujoco import import_ldraw
 
 
+def box_dat(description, extents, offset):
+    box = trimesh.creation.box(extents=extents)
+    box.apply_translation(offset)
+    records = [description, "0 BFC CERTIFY CCW"]
+    for face in box.faces:
+        coords = " ".join(str(x) for x in box.vertices[face].flatten())
+        records.append("3 16 " + coords)
+    return "\n".join(records) + "\n"
+
+
 @pytest.fixture
 def small_library(tmp_path):
     root = tmp_path / "library"
@@ -18,13 +28,14 @@ def small_library(tmp_path):
         "0 !COLOUR White CODE 15 VALUE #FFFFFF EDGE #333333\n"
         "0 !COLOUR Trans_Clear CODE 47 VALUE #FCFCFC EDGE #C3C3C3 ALPHA 128\n"
     )
-    box = trimesh.creation.box(extents=[20, 8, 20])
-    box.apply_translation([0, 4, 0])
-    records = ["0 Synthetic test brick", "0 BFC CERTIFY CCW"]
-    for face in box.faces:
-        coords = " ".join(str(x) for x in box.vertices[face].flatten())
-        records.append("3 16 " + coords)
-    (root / "parts" / "cube.dat").write_text("\n".join(records) + "\n")
+    (root / "parts/cube.dat").write_text(box_dat("0 Synthetic test brick", [20, 8, 20], [0, 4, 0]))
+    # A 4 LDU stud primitive on the cube top; hulls skip it, visuals keep it.
+    (root / "p/stud.dat").write_text(box_dat("0 Stud", [12, 4, 12], [0, -2, 0]))
+    identity = "0 0 0 1 0 0 0 1 0 0 0 1"
+    (root / "parts/brick.dat").write_text(
+        f"0 Synthetic studded brick\n1 16 {identity} cube.dat\n1 16 {identity} stud.dat\n"
+    )
+    (root / "parts/knob.dat").write_text(f"0 Synthetic stud-only part\n1 16 {identity} stud.dat\n")
     return root
 
 
