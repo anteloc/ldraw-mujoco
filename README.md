@@ -13,6 +13,31 @@ without modifying source files. No downloads occur during import.
 
 ```sh
 uv sync --locked
+```
+
+In Python, open the complete model with one independent rigid body per placed DAT.
+The importer resolves geometry and library connectors, builds an editable
+`MjSpec`, and compiles it once in memory.
+
+```python
+import mujoco
+import mujoco.viewer
+
+from ldraw_mujoco import import_ldraw
+
+result = import_ldraw("data/models-annotated/106-1.mpd", individual_parts=True)
+model = result.model
+data = mujoco.MjData(model)
+mujoco.viewer.launch(model, data)
+```
+
+For a headless simulation, call `mujoco.mj_step(model, data)` directly. After
+editing `result.spec`, call `result.spec.compile()` to obtain a new model and
+create matching `MjData`. Use `result.spec.to_xml()` for a portable scene.
+
+To list instance IDs or export from the command line, run
+
+```sh
 uv run ldraw-mujoco inspect data/models-annotated/106-1.mpd
 uv run ldraw-mujoco convert data/models-annotated/106-1.mpd \
   --output output/106-1/scene.xml
@@ -104,23 +129,29 @@ The earlier `grouping` API and `--grouping` modes have been removed. Use
 `individual_parts=True` / `--individual-parts` for loose parts; omit it for
 independently welded submodels, including nested ones.
 
-## Python
+## Shared meshes and connectors
+
+Repeated placements share part-local visual meshes and a convex hull within
+one import. Each geom has its own pose and color. A red brick and a blue copy
+can therefore use the same visual mesh. Scale, shear, and reflections are baked
+into mesh variants. The report's `nmesh` counts the compiled mesh assets.
+
+Look up the connector features for a placed library part in the Python result:
 
 ```python
-from ldraw_mujoco import import_ldraw, inspect_ldraw
-import mujoco
-
-path = "data/models-annotated/106-1.mpd"
-inventory = inspect_ldraw(path)  # inventory["instances"] lists names and IDs.
-result = import_ldraw(
-    path,
-    sections=["106 - wheel assembly.ldr:0/46", "106 - Minifig.ldr"],
-    individual_parts=True,  # Omit for welded submodels; omit sections for the full input.
-)
-model = result.spec.compile()
-data = mujoco.MjData(model)
-xml = result.spec.to_xml()
+tyre = next(o for o in result.report["occurrences"] if o["id"] == "0/46/1")
+ref = tyre["reference"].replace("\\", "/").casefold()
+features = result.connections[ref]  # Tuple of pyldraw3 ConnectionFeature objects
+coverage = result.report["connection_metadata"][ref]["coverage"]
 ```
+
+Positions and profile dimensions are in part-local LDU. Each feature carries
+its frame, kind, role, and available provenance. The occurrence's
+`matrix_ldraw` and `position_ldu` place it in the source assembly. Apply the
+coordinate mapping and `scene_offset_m` to locate the point in the initial
+MuJoCo scene. A queried library part can have an empty tuple. Embedded and
+other document-local DATs have `not_queried` coverage and no dictionary entry.
+MuJoCo computes contacts from the placed collision geoms.
 
 The report's `instances` list identifies included model/submodel/part nodes
 and their bodies (`null` for containers without direct geometry). `occurrences`
@@ -171,6 +202,12 @@ The example exports the full model, car, minifigure, selected wheel/minifigure,
 and individual-parts variants, with inventories, reports and initial images
 under `output/106-1/`. See [architecture notes](docs/architecture.md) for the
 conventions, tests and continuation guidance.
+
+To reproduce the 10,000-body acceptance run on macOS or Linux, run
+`uv run python examples/repeated_bricks.py`. It builds a spaced grid of
+2 × 4 bricks, checks that they share two meshes, and takes one physics step.
+The input and measured import time and peak process memory are in
+`output/repeated-bricks/`.
 
 Code follows the existing GPL-3.0-or-later license; documentation follows the
 existing CC-BY-SA-4.0 notice. LDraw models, parts and shadows retain their own

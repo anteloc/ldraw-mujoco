@@ -1,8 +1,10 @@
 import json
+from itertools import product
 
 import mujoco
 import numpy as np
 import pytest
+from ldraw import ConnectionFeature
 
 from ldraw_mujoco import import_ldraw
 from ldraw_mujoco.cli import main
@@ -203,3 +205,96 @@ def test_sample_counts_and_xml_round_trip(sample):
         np.testing.assert_allclose(
             a.qvel[6 * body + 3 : 6 * body + 6], b.qvel[6 * body + 3 : 6 * body + 6], atol=5e-3
         )
+
+
+def test_shared_meshes_keep_placement_colour_and_independent_motion(build, small_library):
+    part = small_library / "parts/cube.dat"
+    part.write_text(part.read_text() + "3 15 -5 0 -5 5 0 -5 0 0 5\n")
+    result = build(
+        f"1 4 0 0 0 {IDENTITY} cube.dat\n1 1 60 0 0 0 -1 0 1 0 0 0 0 1 cube.dat\n",
+        individual_parts=True,
+        clearance=0.1,
+    )
+    model = result.model
+    a, b = result.report["occurrences"]
+    assert (model.nbody, model.njnt, model.nmesh) == (3, 2, 3)
+    assert model.geom(a["collision_geom"]).dataid == model.geom(b["collision_geom"]).dataid
+    for left, right in zip(a["visual_geoms"], b["visual_geoms"], strict=True):
+        assert model.geom(left).dataid == model.geom(right).dataid
+    colours = [[model.geom(g).rgba for g in o["visual_geoms"]] for o in (a, b)]
+    np.testing.assert_allclose(colours[0], np.array([[201, 26, 9, 255], [255] * 4]) / 255)
+    np.testing.assert_allclose(colours[1], np.array([[0, 85, 191, 255], [255] * 4]) / 255)
+
+    corners = np.array(list(product([-10, 10], [0, 8], [-10, 10])))
+    expected = []
+    for occurrence in (a, b):
+        vertices = corners @ np.array(occurrence["matrix_ldraw"]).T + occurrence["position_ldu"]
+        expected.extend(vertices @ BASIS.T * LDU_TO_METERS + result.report["scene_offset_m"])
+    assert set(map(tuple, collision_points(model).round(8))) == set(
+        map(tuple, np.round(expected, 8))
+    )
+
+    data = mujoco.MjData(model)
+    data.xfrc_applied[model.body(a["body"]).id, 0] = 0.001
+    mujoco.mj_step(model, data)
+    assert data.qvel[0] > 0 and data.qvel[6] == pytest.approx(0)
+    result.spec.option.timestep = 0.01
+    assert result.spec.compile().opt.timestep == 0.01
+    assert model.opt.timestep == 0.001
+
+
+def test_affine_asset_reuse_and_bfc_winding(build):
+    # A reflected shear followed by two translated copies, one inverted.
+    matrix = "-1 0.25 0 0 1 0 0 0 1"
+    result = build(
+        f"1 4 0 0 0 {matrix} cube.dat\n1 4 60 0 0 {matrix} cube.dat\n"
+        f"0 BFC INVERTNEXT\n1 4 120 0 0 {matrix} cube.dat\n"
+        f"1 4 180 0 0 {IDENTITY} cube.dat\n"
+    )
+    model = result.model
+    a, b, inverted, rigid = result.report["occurrences"]
+
+    def mesh_id(occ, visual):
+        name = occ["visual_geoms"][0] if visual else occ["collision_geom"]
+        return int(model.geom(name).dataid[0])
+
+    assert model.nmesh == 5
+    assert mesh_id(a, False) == mesh_id(b, False) == mesh_id(inverted, False)
+    assert mesh_id(rigid, False) != mesh_id(a, False)
+    assert mesh_id(a, True) == mesh_id(b, True) != mesh_id(inverted, True)
+    for occurrence, sign in [(a, 1), (inverted, -1)]:
+        mesh = mesh_id(occurrence, True)
+        start = model.mesh_faceadr[mesh]
+        faces = model.mesh_face[start : start + model.mesh_facenum[mesh]]
+        triangles = model.mesh_vert[model.mesh_vertadr[mesh] + faces]
+        assert np.sign(triangle_mesh(triangles).volume) == sign
+    assert result.report["bodies"][0]["occurrence_count"] == 4
+
+
+def test_resolved_connectors_follow_library_namespace(tmp_path, small_library):
+    shadow = tmp_path / "shadow"
+    (shadow / "parts").mkdir(parents=True)
+    (shadow / "parts/cube.dat").write_text(
+        "0 !LDCAD SNAP_CYL [gender=M] [caps=one] [secs=R 4 8] [pos=1 2 3]\n"
+    )
+    cube = (small_library / "parts/cube.dat").read_text()
+    (small_library / "parts/plain.dat").write_text(cube)
+    path = tmp_path / "main.ldr"
+    path.write_text(
+        f"1 4 0 0 0 {IDENTITY} CUBE.DAT\n1 4 40 0 0 {IDENTITY} cube.dat\n"
+        f"1 4 80 0 0 {IDENTITY} plain.dat\n"
+    )
+    options = dict(library=small_library, cache=tmp_path / "cache", shadows=[shadow])
+    result = import_ldraw(path, **options)
+    assert set(result.connections) == {"cube.dat", "plain.dat"}
+    (feature,) = result.connections["cube.dat"]
+    assert isinstance(feature, ConnectionFeature)
+    assert [feature.position.x, feature.position.y, feature.position.z] == [1, 2, 3]
+    assert feature.connection_provenance is not None
+    assert result.report["connection_metadata"]["cube.dat"]["feature_count"] == 1
+    assert result.connections["plain.dat"] == ()
+    local = tmp_path / "main.mpd"
+    local.write_text("0 FILE main.ldr\n" + path.read_text() + "0 FILE cube.dat\n" + cube)
+    embedded = import_ldraw(local, **options)
+    assert "cube.dat" not in embedded.connections
+    assert embedded.report["connection_metadata"]["cube.dat"]["coverage"] == "not_queried"

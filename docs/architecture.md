@@ -32,26 +32,34 @@ INVERTNEXT, and reverses faces for reflected transforms. Lines and conditional
 line control points are excluded. Degenerate faces are counted and omitted.
 TEXMAP/DATA and assembly-level inline faces fail explicitly in this version.
 
-`importer` bakes placement matrices into vertices. This preserves scale/shear
-in the sample's arm and hand placements without claiming they are rigid
-rotations. The orthogonality warning records this approximation. The coordinate
-rotation has determinant +1 and maps `(x,y,z)` to `(x,z,-y)`; all lengths then
-scale by 0.0004. Using `(x,-z,-y)` would mirror the source.
+`meshes.MeshAssets` registers meshes once per import, keyed by normalized DAT
+reference and the linear transform baked into its vertices. Rigid placements
+use a body-relative geom pose and the canonical part mesh. An orthogonal
+reflection uses a shared X-reflected variant plus a proper rotation. Other
+affine matrices are baked in full, including the scale and shear in the
+sample's arms and hands. The rigid check allows only floating-point roundoff.
+Both vertices and poses use the proper coordinate rotation into MuJoCo and a
+length scale of 0.0004 m/LDU.
 
-Visual faces are grouped by effective RGBA, preserving geometry-based patterns
-and transparency. These meshes use shell inertia mode to permit planar patches
-but contribute no mass. An isolated triangle is subdivided without changing its
-surface, because MuJoCo requires at least four mesh vertices.
+Each shape has one trimesh convex hull. Every occurrence references it from
+a group 3 geom, contributing its own contacts, mass, and inertia. Winding
+variants share the same hull. Transforming just its extreme vertices gives
+the bounds of the placed surface and the common ground offset.
 
-trimesh constructs one convex hull per physical occurrence. Only these hulls
-contribute contacts, mass and inertia. MuJoCo handles their local mesh offsets,
-inertial frames and combination into each body's mass distribution. We avoid
-custom inertia formulas and signed-volume assumptions about open LDraw meshes.
+Visual meshes group faces by their source color, keeping inherited color 16
+as a separate group for per-geom RGBA. Placement-path BFC inversion selects
+the visual winding. Visual geoms have zero mass and disabled contacts.
+Shell-mode visual meshes support planar patches. A lone triangle is subdivided
+in its plane to satisfy MuJoCo's four-vertex minimum.
 
-Each chosen group becomes a free body with all its geoms attached directly.
-Welded groups have no internal constraints or self-contacts. Every body's initial
-orientation is identity; source orientations are already in its local vertices.
-One shared ground offset preserves the input's relative positions.
+Each physical group is a world-parented free body at its original anchor with
+identity initial orientation. The native compiled model is returned alongside
+the editable spec. Changes to the spec take effect on the next compilation.
+
+`ImportedModel.connections` holds pyldraw3's part-local feature tuples for the
+selected library DATs, keyed by normalized reference. Reports carry coverage
+and diagnostics once per reference. Document-local DATs take precedence over
+library names for geometry and retain explicit unqueried connector coverage.
 
 ## Instance selection and body boundaries
 
@@ -102,9 +110,8 @@ body names contain their owning instance IDs. Reports map the canonical IDs
 to those names and retain the source hierarchy for external callers.
 
 Group origins use the containing section's composed origin (or the part origin
-in individual-parts mode). Source matrices remain baked into vertices. One
-shared offset brings the lowest selected point to the requested ground
-clearance, preserving all relative source positions and orientations.
+in individual-parts mode). One shared offset brings the lowest selected point
+to the requested ground clearance, preserving relative source placements.
 
 ## Verification and reproduction
 
@@ -162,8 +169,12 @@ mechanisms with body trees and equality constraints. Those mechanisms are a
 later extension. Its reflection mapping and hand-written approximate inertia
 formulas were not carried into this importer.
 
-Keep the next work focused on callers selecting IDs and choosing the single
-parts/welded flag. Mixed per-instance modes, support contexts, stability verdicts,
+Use `examples/repeated_bricks.py` to reproduce the 10,000-body asset-sharing
+check in a fresh process. Its timing covers source loading through native model
+compilation. Peak resident memory includes constructing the data and taking one
+step with spaced bricks. Dense contact workloads need separate measurements.
+
+Keep the single parts/welded flag for future changes. Mixed per-instance modes, support contexts, stability verdicts,
 attachments and articulated mechanisms are deferred until explicitly requested.
 
 The ID convention comes from Carlos Antelo's

@@ -10,27 +10,28 @@ from pathlib import Path
 
 import mujoco
 import numpy as np
-import trimesh
+from ldraw import ConnectionFeature
 
 from .geometry import (
     BASIS,
     LDU_TO_METERS,
     Document,
-    Surfaces,
     check_transform,
     normalized,
-    triangle_mesh,
     vector,
 )
 from .library import load_library
+from .meshes import MeshAssets
 
 
 @dataclass
 class ImportedModel:
-    """The editable native spec and JSON-serializable import evidence."""
+    """Editable spec, compiled scene, import report and part-local connector features."""
 
     spec: mujoco.MjSpec
     report: dict
+    model: mujoco.MjModel
+    connections: dict[str, tuple[ConnectionFeature, ...]]
 
 
 def inspect_ldraw(path: str | Path) -> dict:
@@ -42,17 +43,32 @@ def _name(text):
     return re.sub(r"[^a-zA-Z0-9_]+", "_", text).strip("_")[:60] or "model"
 
 
-def _add_mesh(spec, name, mesh, *, visual=False):
-    spec.add_mesh(
-        name=name,
-        uservert=mesh.vertices.flatten().tolist(),
-        userface=mesh.faces.flatten().tolist(),
-        inertia=(
-            mujoco.mjtMeshInertia.mjMESH_INERTIA_SHELL
-            if visual
-            else mujoco.mjtMeshInertia.mjMESH_INERTIA_CONVEX
-        ),
-    )
+def _assembly_origin(occ):
+    anchor, rotation = np.zeros(3), np.eye(3)
+    for item in occ.path[:-1]:
+        anchor += rotation @ vector(item.piece.position)
+        rotation = rotation @ np.array(item.piece.matrix.rows)
+    return BASIS @ anchor * LDU_TO_METERS
+
+
+def _library_connections(parts, occ):
+    evidence = parts.geometry(occ.part_code)
+    diagnostics = [d.to_dict() for d in evidence.diagnostics]
+    errors = [
+        d
+        for d in diagnostics
+        if not (d["severity"] == "warning" and d["code"].startswith("connection."))
+    ]
+    if errors:
+        raise ValueError(f"Incomplete geometry for {occ.reference}: {errors}")
+    report = evidence.connection_metadata
+    return evidence.connections, {
+        "feature_count": len(evidence.connections),
+        "coverage": str(report.coverage) if report else "none",
+        "source_count": report.source_count if report else 0,
+        "recognized_record_count": report.recognized_record_count if report else 0,
+        "diagnostics": diagnostics,
+    }
 
 
 def import_ldraw(
@@ -78,7 +94,7 @@ def import_ldraw(
     must match the instance. Bare IDs are not accepted. Selection preserves full-input
     IDs, ancestor transforms and colors; overlapping selections form a union.
     ``shadows=[]`` disables external connector metadata. The returned spec is
-    compiled once for validation and is still editable by the caller.
+    compiled once into ``result.model``. Recompile after editing the spec.
     """
     path = Path(path).resolve()
     if not isinstance(individual_parts, bool):
@@ -96,95 +112,6 @@ def import_ldraw(
     occurrences = document.occurrences()
     if not occurrences:
         raise ValueError(f"No physical part occurrences in {path}")
-    surfaces = Surfaces(document)
-    warnings, groups, placements, metadata = [], {}, [], {}
-    if individual_parts:
-        warnings.append(
-            {
-                "code": "independent_parts",
-                "message": "Parts have independent free joints and no attachment constraints. "
-                "Convex hulls of assembled parts can overlap and push each other apart.",
-            }
-        )
-
-    for index, occ in enumerate(occurrences):
-        instance_id = document.occurrence_id(occ)
-        matrix, position = np.array(occ.matrix.rows), vector(occ.position)
-        check_transform(matrix, position, occ.reference)
-        error = float(np.max(np.abs(matrix.T @ matrix - np.eye(3))))
-        if error > 1e-5:
-            warnings.append(
-                {
-                    "code": "affine_placement",
-                    "occurrence": index,
-                    "instance_id": instance_id,
-                    "orthogonality_error": error,
-                    "message": "Source scale/shear baked into visual and collision vertices",
-                }
-            )
-        surface = surfaces.get(occ.reference)
-        if not len(surface.triangles):
-            raise ValueError(f"No surface geometry for occurrence {index}: {occ.reference}")
-        triangles = (surface.triangles @ matrix.T + position) @ BASIS.T * LDU_TO_METERS
-        inversion = sum(id(p.piece) in document.inverted for p in occ.path) % 2
-        if (np.linalg.det(matrix) < 0) != bool(inversion):
-            triangles = triangles[:, ::-1]
-        if individual_parts:
-            key = instance_id
-            origin = position @ BASIS.T * LDU_TO_METERS
-        else:
-            # Only direct parts belong to this assembly; nested assemblies get
-            # their own world-parented free bodies, with no inter-body welds.
-            key = document.instances[instance_id]["parent_id"]
-            anchor, rotation = np.zeros(3), np.eye(3)
-            for item in occ.path[:-1]:
-                anchor += rotation @ vector(item.piece.position)
-                rotation = rotation @ np.array(item.piece.matrix.rows)
-            origin = anchor @ BASIS.T * LDU_TO_METERS
-        if key not in groups:
-            label = document.instances[key]["reference"]
-            groups[key] = {
-                "name": f"body_{key.replace('/', '_')}_{_name(label)}",
-                "instance_id": key,
-                "source": label,
-                "origin": origin,
-                "occurrences": [],
-            }
-        groups[key]["occurrences"].append(index)
-        placements.append((occ, surface, triangles, key))
-
-        reference = normalized(occ.reference)
-        if reference not in metadata:
-            if reference in document.models:
-                metadata[reference] = {"coverage": "not_queried", "reason": "document-local part"}
-            else:
-                evidence = parts.geometry(occ.part_code)
-                diagnostics = [d.to_dict() for d in evidence.diagnostics]
-                errors = [
-                    d
-                    for d in diagnostics
-                    if not (d["severity"] == "warning" and d["code"].startswith("connection."))
-                ]
-                if errors:
-                    raise ValueError(f"Incomplete geometry for {occ.reference}: {errors}")
-                connection_report = evidence.connection_metadata
-                metadata[reference] = {
-                    "feature_count": len(evidence.connections),
-                    "coverage": str(connection_report.coverage) if connection_report else "none",
-                    "source_count": connection_report.source_count if connection_report else 0,
-                    "recognized_record_count": connection_report.recognized_record_count
-                    if connection_report
-                    else 0,
-                    "diagnostics": diagnostics,
-                }
-
-    bounds = np.array(
-        [
-            np.min([p[2].min(axis=(0, 1)) for p in placements], axis=0),
-            np.max([p[2].max(axis=(0, 1)) for p in placements], axis=0),
-        ]
-    )
-    offset = np.array([0.0, 0.0, clearance - bounds[0, 2]])
     spec = mujoco.MjSpec()
     spec.modelname = _name(path.stem)
     spec.compiler.degree = False
@@ -201,59 +128,108 @@ def import_ldraw(
         condim=3,
     )
     spec.worldbody.add_light(name="key_light", pos=[0.2, -0.3, 0.6], dir=[-0.2, 0.3, -0.6])
-    for group in groups.values():
-        body = spec.worldbody.add_body(name=group["name"], pos=group["origin"] + offset)
-        body.add_freejoint(name=group["name"] + "_free")
-        group["body"] = body
-
-    occurrence_report = []
-    for index, (occ, surface, triangles, key) in enumerate(placements):
-        group = groups[key]
-        local = triangles - group["origin"]
+    assets = MeshAssets(spec, document)
+    groups, metadata, connections = {}, {}, {}
+    occurrence_report, warnings = [], []
+    if individual_parts:
+        warnings.append(
+            {
+                "code": "independent_parts",
+                "message": "Parts have independent free joints and no attachment constraints. "
+                "Convex hulls of assembled parts can overlap and push each other apart.",
+            }
+        )
+    low, high = np.full(3, np.inf), np.full(3, -np.inf)
+    palette = {}
+    identity = np.eye(3)
+    reflection = np.diag([-1.0, 1.0, 1.0])
+    for index, occ in enumerate(occurrences):
         instance_id = document.occurrence_id(occ)
+        reference = normalized(occ.reference)
+        matrix, position = np.array(occ.matrix.rows), vector(occ.position)
+        check_transform(matrix, position, occ.reference)
+        mirrored = np.linalg.det(matrix) < 0
+        error = float(np.max(np.abs(matrix.T @ matrix - identity)))
+        # A quaternion can carry only a proper rotation. Preserve even small
+        # source distortions in the asset, apart from floating-point roundoff.
+        if error <= 1e-14:
+            bake = reflection if mirrored else identity
+            rotation = BASIS @ (matrix @ bake) @ BASIS.T
+        else:
+            bake, rotation = matrix, identity
+        if error > 1e-5:
+            warnings.append(
+                {
+                    "code": "affine_placement",
+                    "occurrence": index,
+                    "instance_id": instance_id,
+                    "orthogonality_error": error,
+                    "message": "Source scale/shear baked into visual and collision vertices",
+                }
+            )
+        inverted = sum(id(p.piece) in document.inverted for p in occ.path) % 2
+        reverse = mirrored != bool(inverted)
+        meshes = assets.get(reference, bake, reverse)
+        quat = np.empty(4)
+        mujoco.mju_mat2Quat(quat, rotation.ravel())
+        position_m = BASIS @ position * LDU_TO_METERS
+        vertices = meshes.hull_vertices @ rotation.T + position_m
+        bounds = np.array([vertices.min(axis=0), vertices.max(axis=0)])
+        low, high = np.minimum(low, bounds[0]), np.maximum(high, bounds[1])
+
+        key = instance_id if individual_parts else document.instances[instance_id]["parent_id"]
+        if key not in groups:
+            label = document.instances[key]["reference"]
+            origin = position_m if individual_parts else _assembly_origin(occ)
+            name = f"body_{key.replace('/', '_')}_{_name(label)}"
+            body = spec.worldbody.add_body(name=name, pos=origin)
+            body.add_freejoint(name=name + "_free")
+            groups[key] = {
+                "name": name,
+                "instance_id": key,
+                "source": label,
+                "origin": origin,
+                "occurrence_count": 0,
+                "body": body,
+            }
+        group = groups[key]
+        group["occurrence_count"] += 1
+        local_position = position_m - group["origin"]
         prefix = f"part_{instance_id.replace('/', '_')}_{_name(occ.part_code)}"
-        try:
-            hull = trimesh.convex.convex_hull(local.reshape(-1, 3))
-        except Exception as exc:
-            raise ValueError(f"Cannot build 3D collision hull for {occ.reference}: {exc}") from exc
         collision = prefix + "_collision"
-        _add_mesh(spec, collision + "_mesh", hull)
         group["body"].add_geom(
             name=collision,
             type=mujoco.mjtGeom.mjGEOM_MESH,
-            meshname=collision + "_mesh",
+            meshname=meshes.collision,
+            pos=local_position,
+            quat=quat,
             group=3,
             density=density,
             friction=[friction, 0.005, 0.0001],
             condim=3,
         )
-        colour_groups = {}
-        for face_index, colour in enumerate(surface.colours):
-            if colour.code == 16:
-                colour = occ.colour
-            if colour.code == 16:
-                colour = parts.resolve_colour(7)
-                if not any(w["code"] == "root_colour" for w in warnings):
+        visuals = []
+        for number, (meshname, face_colour) in enumerate(meshes.visuals[reverse]):
+            colour = occ.colour if face_colour.code == 16 else face_colour
+            if colour not in palette:
+                if colour.code == 16:
                     warnings.append(
                         {"code": "root_colour", "message": "Unresolved root color 16 uses color 7"}
                     )
-            colour = parts.resolve_colour(colour)
-            if colour.rgb is None:
-                raise ValueError(f"No RGB value for color {colour.code} in {occ.reference}")
-            rgba = tuple(int(colour.rgb[i : i + 2], 16) / 255 for i in (1, 3, 5)) + (
-                colour.swatch_alpha / 255,
-            )
-            colour_groups.setdefault(rgba, []).append(face_index)
-        visuals = []
-        for number, (rgba, face_indices) in enumerate(colour_groups.items()):
+                resolved = parts.resolve_colour(7 if colour.code == 16 else colour)
+                if resolved.rgb is None:
+                    raise ValueError(f"No RGB value for color {colour.code} in {occ.reference}")
+                palette[colour] = tuple(
+                    int(resolved.rgb[i : i + 2], 16) / 255 for i in (1, 3, 5)
+                ) + (resolved.swatch_alpha / 255,)
             name = f"{prefix}_visual_{number}"
-            mesh = triangle_mesh(local[face_indices])
-            _add_mesh(spec, name + "_mesh", mesh, visual=True)
             group["body"].add_geom(
                 name=name,
                 type=mujoco.mjtGeom.mjGEOM_MESH,
-                meshname=name + "_mesh",
-                rgba=rgba,
+                meshname=meshname,
+                pos=local_position,
+                quat=quat,
+                rgba=palette[colour],
                 mass=0,
                 density=0,
                 contype=0,
@@ -261,6 +237,12 @@ def import_ldraw(
                 group=0,
             )
             visuals.append(name)
+        if reference not in metadata:
+            if reference in document.models:
+                metadata[reference] = {"coverage": "not_queried", "reason": "document-local part"}
+            else:
+                connections[reference], metadata[reference] = _library_connections(parts, occ)
+
         occurrence_report.append(
             {
                 "index": index,
@@ -274,16 +256,17 @@ def import_ldraw(
                     for p in occ.path
                 ],
                 "matrix_ldraw": occ.matrix.rows,
-                "position_ldu": vector(occ.position).tolist(),
-                "bounds_m": [
-                    triangles.min(axis=(0, 1)).tolist(),
-                    triangles.max(axis=(0, 1)).tolist(),
-                ],
+                "position_ldu": position.tolist(),
+                "bounds_m": bounds.tolist(),
                 "collision_geom": collision,
                 "visual_geoms": visuals,
-                "estimated_mass_kg": float(hull.volume * density),
+                "estimated_mass_kg": meshes.volume * density,
             }
         )
+
+    offset = np.array([0.0, 0.0, clearance - low[2]])
+    for group in groups.values():
+        group["body"].pos = group["origin"] + offset
 
     # Compile here to fail before a CLI writes a successful-looking artifact.
     model = spec.compile()
@@ -295,7 +278,7 @@ def import_ldraw(
                 "name": group["name"],
                 "instance_id": group["instance_id"],
                 "source": group["source"],
-                "occurrence_count": len(group["occurrences"]),
+                "occurrence_count": group["occurrence_count"],
                 "initial_position_m": body.pos.tolist(),
                 "estimated_mass_kg": float(body.mass[0]),
                 "inertia_kg_m2": body.inertia.tolist(),
@@ -331,6 +314,7 @@ def import_ldraw(
         "nq": model.nq,
         "nv": model.nv,
         "nbody": model.nbody,
+        "nmesh": model.nmesh,
         "options": {
             "density_kg_m3": density,
             "sliding_friction": friction,
@@ -338,13 +322,13 @@ def import_ldraw(
             "ground_clearance_m": clearance,
         },
         "coordinate_mapping": "0.0004 * (x, z, -y)",
-        "source_bounds_m": bounds.tolist(),
+        "source_bounds_m": [low.tolist(), high.tolist()],
         "scene_offset_m": offset.tolist(),
         "bodies": body_report,
         "occurrences": occurrence_report,
         "connection_metadata": metadata,
         "warnings": warnings,
-        "dropped_degenerate_faces": surfaces.dropped_degenerate,
+        "dropped_degenerate_faces": assets.surfaces.dropped_degenerate,
         "assumptions": [
             "Rigid grouping is user-selected, not inferred from connectors.",
             "One convex hull per occurrence fills cavities; overlapping hull volumes are counted separately.",
@@ -356,4 +340,4 @@ def import_ldraw(
             ),
         ],
     }
-    return ImportedModel(spec, report)
+    return ImportedModel(spec, report, model, connections)
