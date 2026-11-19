@@ -230,7 +230,9 @@ def hold(model, *, seconds=5.0, tolerance=0.002, settle=0.2, data=None):
         "numerically_valid": valid,
         "warnings": warnings,
         "interpretation": "Holds means no body moved more than the tolerance after settling, "
-        "under approximate physics: no clutch or stud interlock, uncalibrated soft contacts. "
+        "under approximate physics: parts stay together only through the imported "
+        "attachments (rigid links without clutch limits, joints with uncalibrated friction); "
+        "studs alone give no interlock, and contacts are soft. "
         "Falls that end within the settle window are only reported. "
         "Not proof of physical stability.",
     }

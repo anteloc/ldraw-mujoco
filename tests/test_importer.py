@@ -196,9 +196,13 @@ def test_sample_counts_and_xml_round_trip(sample):
     report = sample.report
     assert (report["occurrence_count"], report["unique_parts"]) == (65, 36)
     assert [b["occurrence_count"] for b in report["bodies"]] == [45, 2, 2, 2, 2, 2, 10]
+    # The car carries its five wheel assemblies on pins; the minifigure stands free.
+    car, *wheels, minifigure = report["bodies"]
+    assert car["joint"] == minifigure["joint"] == "free"
+    assert all((w["parent"], w["joint"]) == (car["name"], "hinge") for w in wheels)
     first = sample.spec.compile()
     second = mujoco.MjModel.from_xml_string(sample.spec.to_xml())
-    assert (first.nbody, first.nq, first.nv) == (8, 49, 42)
+    assert (first.nbody, first.nq, first.nv) == (8, 19, 17)
     assert np.all(first.body_mass[1:] > 0)
     assert np.all(first.body_inertia[1:] > 0)
     for name in ("body_pos", "geom_pos", "geom_size"):
@@ -221,19 +225,9 @@ def test_sample_counts_and_xml_round_trip(sample):
     for _ in range(100):
         mujoco.mj_step(first, a)
         mujoco.mj_step(second, b)
-    for body in range(first.njnt):
-        np.testing.assert_allclose(
-            a.qpos[7 * body : 7 * body + 3], b.qpos[7 * body : 7 * body + 3], atol=1e-6
-        )
-        np.testing.assert_allclose(
-            a.qpos[7 * body + 3 : 7 * body + 7], b.qpos[7 * body + 3 : 7 * body + 7], atol=1e-5
-        )
-        np.testing.assert_allclose(
-            a.qvel[6 * body : 6 * body + 3], b.qvel[6 * body : 6 * body + 3], atol=1e-4
-        )
-        np.testing.assert_allclose(
-            a.qvel[6 * body + 3 : 6 * body + 6], b.qvel[6 * body + 3 : 6 * body + 6], atol=5e-3
-        )
+    # Compare world poses, which do not depend on how joints split qpos.
+    np.testing.assert_allclose(a.xpos, b.xpos, atol=1e-6)
+    np.testing.assert_allclose(a.xquat, b.xquat, atol=1e-5)
 
 
 def test_shared_meshes_keep_placement_colour_and_independent_motion(build, small_library):

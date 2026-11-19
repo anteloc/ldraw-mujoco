@@ -43,10 +43,21 @@ def main(argv=None):
     convert.add_argument(
         "--individual-parts",
         action="store_true",
-        help="One independent free body per placed DAT part, never per geometric subpart",
+        help="One body per placed DAT part, never per geometric subpart",
+    )
+    convert.add_argument(
+        "--no-attach",
+        action="store_true",
+        help="Leave every body free instead of attaching bodies by their mated connectors",
     )
     convert.add_argument("--density", type=float, default=1050, help="Estimated density in kg/m³")
     convert.add_argument("--friction", type=float, default=0.6, help="Sliding friction coefficient")
+    convert.add_argument(
+        "--joint-friction",
+        type=float,
+        default=0.01,
+        help="Friction torque of pin, clip, hinge and ball joints in N·m; 0 lets them swing",
+    )
     convert.add_argument("--timestep", type=float, default=0.001, help="Seconds")
     convert.add_argument(
         "--clearance", type=float, default=0.001, help="Initial ground clearance in meters"
@@ -94,9 +105,11 @@ def main(argv=None):
                 library=args.library,
                 shadows=[] if args.no_shadow else args.shadow,
                 individual_parts=args.individual_parts,
+                attach=not args.no_attach,
                 sections=args.section,
                 density=args.density,
                 friction=args.friction,
+                joint_friction=args.joint_friction,
                 timestep=args.timestep,
                 clearance=args.clearance,
                 solver=args.solver,

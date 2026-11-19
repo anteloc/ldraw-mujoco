@@ -1,8 +1,9 @@
 # LDraw in MuJoCo
 
-Import `.mpd`, `.ldr` and `.dat` files as independent submodel bodies or
-individual physical parts. One pyldraw3 → `MjSpec` builder supports Python
-and self-contained MJCF export.
+Import `.mpd`, `.ldr` and `.dat` files as submodel bodies or individual
+physical parts, attached where their LDraw connectors mate: studs hold
+rigidly, pins, clips and hinges turn. One pyldraw3 → `MjSpec` builder
+supports Python and self-contained MJCF export.
 
 ## Quick start
 
@@ -16,8 +17,9 @@ uv sync --locked
 ```
 
 In Python, import the complete model, check once that it holds still, then look
-at the result. The importer resolves geometry and library connectors, builds an
-editable `MjSpec`, and compiles it once in memory.
+at the result. The importer resolves geometry and library connectors, attaches
+the parts whose connectors mate, builds an editable `MjSpec`, and compiles it
+once in memory.
 
 ```python
 from ldraw_mujoco import import_ldraw
@@ -101,26 +103,29 @@ selected point 1 mm above ground; relative placement is preserved.
 
 ## Welded or individual parts
 
-There is one switch for the entire import operation:
+There is one grouping switch for the entire import operation:
 
 | Mode | Result |
 |---|---|
-| Default | Each model/submodel instance's **direct parts** share one rigid body. Every child submodel is independent of its parent and siblings. |
-| `--individual-parts` | Every included physical part occurrence gets its own free body. No parts are welded together. |
+| Default | Each model/submodel instance's **direct parts** share one rigid body. A child submodel is a body of its own. |
+| `--individual-parts` | Every included physical part occurrence gets its own body. No parts are welded together. |
 
 An assembly containing only child submodels remains an identified container;
 it gets no empty physics body. Loose parts directly under the root share its
 body. A flat model without submodels therefore imports as one body by default.
-All physics bodies have free joints under the world. “Welded” means attaching
-geoms to the same body, not introducing constraints between submodels.
+“Welded” means attaching geoms to the same body. Sections never decide how
+bodies attach to each other: their mated connectors do (see
+[Connections](#connections-studs-pins-and-hinges)). Bodies without mated
+connectors have free joints under the world.
 
 For 106-1, default import gives **seven bodies**: car direct parts (45), five
-wheel assemblies (2 each), and minifigure (10). Importing only the car gives
-six bodies. Individual-parts mode gives 65 bodies for the full model, 55 for
-the car, or two for a selected wheel instance.
+wheel assemblies (2 each), and minifigure (10). The wheels turn on the car's
+wheel pins; the minifigure stands free. Importing only the car gives six
+bodies. Individual-parts mode gives 65 bodies for the full model, 55 for the
+car, or two for a selected wheel instance.
 
 ```sh
-# Independent parts throughout the full model.
+# Individual parts throughout the full model, attached by their connectors.
 uv run ldraw-mujoco convert data/models-annotated/106-1.mpd \
   --individual-parts --output output/106-1/parts.xml
 
@@ -135,8 +140,59 @@ DATs. A brick's studs, faces, primitives and geometric subparts stay within
 that brick. Selection and welding never split them into separate bodies.
 
 The earlier `grouping` API and `--grouping` modes have been removed. Use
-`individual_parts=True` / `--individual-parts` for loose parts; omit it for
-independently welded submodels, including nested ones.
+`individual_parts=True` / `--individual-parts` for one body per part; omit it
+for one body per submodel instance, including nested ones.
+
+## Connections: studs, pins and hinges
+
+By default, bodies attach where pyldraw3 confirms that their connectors mate.
+Connector features come from library primitives and the LDCad shadow library
+(`data/offLibShadow`). Each mated pair becomes the MuJoCo equivalent:
+
+| Mated connectors | MuJoCo |
+|---|---|
+| Stud in a stud receptacle, tyre on a rim, axle in an axle hole | Rigid: a child body without a joint |
+| Pin or axle in a round hole, bar in a clip, hinge fingers | Hinge joint about the connector axis |
+| LDCad generic connector with free placement (ball sockets) | Ball joint at the connector |
+
+Connected bodies form one tree under a free root. Two connectors on different
+axes, such as two pins, hold two bodies rigidly. A hinge or ball joint that
+would close a loop becomes a `connect` equality constraint with a contact
+exclusion. MuJoCo does not compute contacts between bodies that are rigidly
+attached, nor between a jointed body and its parent.
+
+```sh
+# Independent free bodies, as before attachment existed.
+uv run ldraw-mujoco convert data/models-annotated/106-1.mpd \
+  --individual-parts --no-attach --output output/106-1/parts-free.xml
+
+# Joints that swing freely; the default 0.01 N·m holds poses.
+uv run ldraw-mujoco convert data/models-annotated/106-1.mpd \
+  --joint-friction 0 --output output/106-1/free-joints.xml
+```
+
+In Python, use `attach=False` and `joint_friction=...` (N·m). The report adds:
+
+- `bodies[].parent` and `bodies[].joint` (`free`, `rigid`, `hinge`, `ball`).
+- `links`: each attachment's bodies, kind, anchor and axis in meters, contact
+  count, and the part IDs that carry it. `constraint` is `tree` for the body
+  tree and `loop` for equality constraints.
+- `connections`: contact counts by status and connector kind, and
+  `unlinked_parts`, the parts without a confirmed mate.
+
+The modeling is deliberately simple:
+
+- Rigid links never break: there is no clutch limit.
+- Every hinge and ball joint has the same uncalibrated friction torque, held
+  without creep, so posed hinges and limbs stay put while wheels need a push.
+- LDCad's `slide` option is an editing aid, not a physical freedom, so links
+  never slide.
+- Only connectors that pyldraw3 confirms count; heuristic matches are reported
+  but not used.
+- Parts placed with real scale or shear have no connectors, as pyldraw3 rules.
+
+For 106-1, 59 of 65 parts attach. The minifigure's hair, arms and hands, and
+one ladder plate, have no confirmed mate. The source scales the arms and hands.
 
 ## Shared meshes and connectors
 
@@ -159,8 +215,8 @@ its frame, kind, role, and available provenance. The occurrence's
 `matrix_ldraw` and `position_ldu` place it in the source assembly. Apply the
 coordinate mapping and `scene_offset_m` to locate the point in the initial
 MuJoCo scene. A queried library part can have an empty tuple. Embedded and
-other document-local DATs have `not_queried` coverage and no dictionary entry.
-MuJoCo computes contacts from the placed collision geoms.
+other document-local DATs have `not_queried` coverage and no dictionary entry,
+so they never attach. MuJoCo computes contacts from the placed collision geoms.
 
 The report's `instances` list identifies included model/submodel/part nodes
 and their bodies (`null` for containers without direct geometry). `occurrences`
@@ -189,10 +245,15 @@ uv run ldraw-mujoco hold SCENE.xml --seconds 5 --tolerance 0.002 --settle 0.2
 - The report lists `moved_bodies` by name and displacement. `--viewer` then
   shows the result with those bodies in red, and `--snapshot` saves it as PNG.
 
-A verdict reflects the approximations below. There is no clutch and studs are
-visual only, so parts held by studs, including SNOT parts, fall in
-individual-parts mode. In the default mode, submodels resting on other
-submodels can topple. "Holds" is therefore not proof of real-world stability.
+A verdict reflects the approximations below and the attachment rules above.
+Parts stay together only through their mated connectors, which never break.
+A part without a confirmed mate is held by nothing but contacts: studs alone
+give no interlock, so such parts fall when only studs held them. "Holds" is
+therefore not proof of real-world stability.
+
+For 106-1, the full scene and the car hold for 5 s; before attachment, the
+spare wheel fell off. With individual parts, one part moves instead of 18: the
+scaled left arm, which has no connectors.
 
 Measured on a 2,175-part garden: the welded import (41 bodies) answers in 4 s,
 and individual parts with `--solver cg` in 39 s. With the default Newton
@@ -207,8 +268,7 @@ uv run ldraw-mujoco simulate output/106-1/scene.xml --seconds 1 \
 ```
 
 `simulate` runs the full duration and writes motion, contacts, energy and
-numerical warnings to `.simulation.json`, without a verdict. There are no
-constraints between the imported free bodies.
+numerical warnings to `.simulation.json`, without a verdict.
 
 On macOS, viewers need `mjpython`, for example
 `.venv/bin/mjpython -m ldraw_mujoco hold SCENE.xml --viewer`. With a
@@ -227,10 +287,12 @@ edit the returned spec or run physics.
 - Library: `--library`, then `LDRAW_DIR`, then project-local `data/ldraw`.
 - Shadows: repeat `--shadow`, or set `LDRAW_SHADOW` to paths separated by the
   platform path separator. Defaults to `data/offLibShadow`. `--no-shadow` or
-  Python `shadows=[]` disables external connector metadata.
+  Python `shadows=[]` disables external connector metadata, so far fewer
+  parts attach.
 - Defaults: timestep 1 ms, gravity −9.81 m/s², clearance 1 mm, density
-  1050 kg/m³ and sliding friction 0.6. `--timestep`, `--clearance`, `--density`
-  and `--friction` change these uncalibrated assumptions.
+  1050 kg/m³, sliding friction 0.6 and joint friction 0.01 N·m. `--timestep`,
+  `--clearance`, `--density`, `--friction` and `--joint-friction` change these
+  uncalibrated assumptions.
 - Solver: Newton (MuJoCo's default) by default. Use `--solver cg` (Python:
   `solver="cg"`) for thousands of touching individual parts. They form a huge
   contact island, where Newton needs 13–39 s per step and CG under 0.5 s.
@@ -243,8 +305,9 @@ edit the returned spec or run physics.
   Only hulls contribute mass/inertia. Texture images and inline faces in LDR
   assemblies are unsupported; use geometry-based patterns or embedded DATs.
 - Full source assembly references must resolve for indexing. Geometry is built
-  only for selected part occurrences. Shadow metadata is diagnostic, not a
-  source of joints or attachment strength.
+  only for selected part occurrences, and only selected parts attach to each
+  other. Connector metadata decides attachment and joints, never attachment
+  strength.
 
 ## Development and reproduction
 
@@ -255,7 +318,8 @@ uv run ruff check .
 ```
 
 The example exports the full model, car, minifigure, selected wheel/minifigure,
-and individual-parts variants, with inventories, reports, initial images and
+and individual-parts variants, plus `parts-free` (individual parts without
+attachment) for comparison. It writes inventories, reports, initial images and
 hold checks under `output/106-1/`. See [architecture notes](docs/architecture.md) for the
 conventions, tests and continuation guidance.
 

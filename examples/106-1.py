@@ -1,5 +1,7 @@
 """Export full and selected instances, in both modes, with initial views and hold checks.
 
+Bodies attach by their mated connectors; "parts-free" shows the same parts unattached.
+
 Run with: uv run python examples/106-1.py
 """
 
@@ -26,6 +28,7 @@ def main():
         "minifigure": {"sections": "106 - Minifig.ldr"},
         "selection": {"sections": selection},
         "parts": {"individual_parts": True},
+        "parts-free": {"individual_parts": True, "attach": False},
         "selection-parts": {"sections": selection, "individual_parts": True},
     }
     for name, options in examples.items():

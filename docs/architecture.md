@@ -74,6 +74,135 @@ selected library DATs, keyed by normalized reference. Reports carry coverage
 and diagnostics once per reference. Document-local DATs take precedence over
 library names for geometry and retain explicit unqueried connector coverage.
 
+`import_ldraw` works in three phases. It places every occurrence and registers
+its meshes, links bodies by their mated connectors (`connections.py`), and only
+then builds bodies, parents first, adding each occurrence's geoms. Body
+creation waits because a body's parent depends on the connections of all
+parts.
+
+## Connections and attachment
+
+`connections.mated_contacts` hands pyldraw3 its own placed occurrences
+(`OccurrenceGeometry` in a `ModelInspection`) and calls
+`connection_contacts()`, pyldraw3's matcher. Only `confirmed` contacts attach
+bodies; heuristic-only matches are counted in the report. Each contact then
+becomes a link:
+
+| Mated connectors | Link | MuJoCo |
+|---|---|---|
+| stud ↔ stud receptacle, rim seat ↔ tyre bead | rigid (clutch, press fit) | child body without a joint |
+| axle ↔ axle hole (both cross-sections axle or square) | rigid | child body without a joint |
+| pin ↔ pin hole (also an axle in a round hole), bar ↔ clip, hinge fingers | hinge about the first feature's axis | `hinge` joint |
+| generic with free placement | ball at the first feature | `ball` joint |
+| generic, aligned | rigid | child body without a joint |
+
+LDCad's `slide` option lets an editor slide parts together. It is not a
+physical freedom: friction holds the axial position, so links never slide.
+
+All contacts between two bodies combine into one link:
+
+- Any rigid contact makes the pair rigid.
+- Hinges stay a hinge only when they are collinear: axes within 2° (pyldraw3's
+  angular tolerance) and anchors within 1 LDU of the axis line.
+- Balls must share one center. A ball on a hinge axis leaves the hinge.
+- Anything else is rigid. Two pins on different axes lock two beams together.
+
+`connections.forest` picks the body trees with Kruskal's algorithm, taking
+rigid links first. Rigidly connected bodies therefore form exactly rigid
+clusters. A rigid link never closes a loop, and a joint inside one cluster is
+locked and dropped. A joint between clusters that other links already join
+closes a loop. It becomes a `connect` equality constraint at its anchor, plus a
+contact exclusion for the two bodies. Each tree is rooted at its lowest body
+index, which in source order is the car rather than one of its wheels. Edges
+point away from the root.
+
+The importer builds the trees under the world:
+
+- Roots get a free joint. Children are placed relative to their parent.
+- Every body keeps the world orientation at import, so a child's frame is its
+  parent's frame shifted to the child's origin.
+- Hinge and ball joints sit at the link's anchor and carry
+  `frictionloss=joint_friction` (default 0.01 N·m).
+
+MuJoCo already filters the contacts that attachment would otherwise create.
+Bodies without joints between them share a weld group and never collide. A
+jointed body does not collide with its parent's weld group, which this
+experiment confirmed: a hinged child did not collide with a body rigidly
+attached to its parent. Wheels therefore turn inside their mudguards' filled
+hulls. The price is that a hinged lid can swing through its parent's rigid
+cluster, which its joint friction normally prevents.
+
+**Joint friction must be a hard constraint.** At MuJoCo's default friction
+impedance (`solimpfriction` 0.9), a constant load makes a joint creep instead
+of sticking:
+
+| Hinge friction setup | 12 cm beam, 4.75 N·mm load, tip travel in 5 s | 106-1 car wheels, rotation in 5 s |
+|---|---|---|
+| Default impedance 0.9 | 72.6 mm | 88–99 mrad |
+| Default impedance 0.9, `noslip_iterations=10` | 0.0 mm | 86–99 mrad |
+| Impedance 0.999 | 0.73 mm | 0.11 mrad |
+| Impedance 0.9999 (`HARD_FRICTION`) | 0.07 mm | 0.007 mrad |
+
+The value of the friction above the load made no difference, so the creep
+comes from the soft constraint, not from the friction value. Noslip fixed a
+single hinge but not the car's coupled wheels, ground contacts and free root.
+The maximum impedance fixes both, so joints use it. A friction limit below the
+load still lets the joint swing (a 3 N·mm limit gave 190 mm of tip travel).
+
+### pyldraw3 1.7.0 workarounds
+
+pyldraw3 1.7.0 (the latest release) has three gaps that hide most stud
+connections in real models. `connections.py` corrects each one on the placed
+features, before pyldraw3's own matcher runs. Each is marked for removal once
+pyldraw3 handles it.
+
+1. **Rounded rotations void authored features.** A placement more than 1e-6
+   from orthonormal gives LDCad features zero confidence. In 10030-1, 2,959 of
+   3,037 placements are rounded by 1e-6 to 1e-2. `_rotation` uses the nearest
+   rotation, the SVD polar factor, which keeps reflections, when the source
+   matrix is within 1e-2 of it. Real scale or shear stays and still voids the
+   features: 106-1's minifigure arms and hands, at 2.9 %, never attach.
+2. **LDCad sockets point the other way.** LDCad authors a stud and its socket
+   along the same local -Y axis, so a mated pair is co-located and
+   co-directional. pyldraw3's strict stud check wants the socket axis opposing
+   the stud, like its primitive tube receptacles. As a result only tubes ever
+   matched.
+3. **Square sockets never seat round studs.** LDCad's 1 × N and 1 × 1 sockets
+   are square (`secs=S 6 4`). pyldraw3 mates only identical section shapes.
+
+`_socket` fixes the second and third gap. It reverses an LDCad
+`STUD_RECEPTACLE`'s axis with a proper rotation and moves its position to the
+other end unless it is centered, so the physical extent is unchanged. It also
+turns square sections round.
+
+`_placed` also replaces `inspect_model`'s exact bounds. Those transform every
+expanded point in pure Python and took 72 % of its time. `_placed` transforms
+the 8 local box corners instead, because the bounds only guide pyldraw3's
+search for candidate pairs.
+
+| Model | pyldraw3 as is | With the workarounds |
+|---|---|---|
+| 106-1, 65 parts | 53 contacts, 37 parts connected | 143 contacts, 59 parts connected |
+| 6399-1, 788 parts | not measured | 1,853 contacts, 685 parts connected |
+| 10030-1, 3,037 parts | 97 contacts, 73 parts connected, 42 s | 12,646 contacts, 2,832 parts connected, 27 s |
+
+Draft upstream reports (not filed):
+
+- *Strict stud matching ignores LDCad socket direction*: LDCad `SNAP_CYL`
+  female stud sockets extend along the same -Y as studs (for example plate
+  3022 `[gender=F] [secs=R 6 4] [pos=0 8 0]`). `_strict_stud_candidate`
+  requires `-stud.axis·receptacle.axis ≈ 1`, so shadow-only stud pairs never
+  match.
+- *Round studs never mate square LDCad sockets*:
+  `_cylindrical_profiles_compatible` requires the same section shape, but
+  LDCad's 1 × N plates and bricks (3710, 3024, 3004 via `s/3004s01.dat`)
+  define square `S 6` sockets that accept round `R 6` studs.
+- *Authored features are voided by rounded rotations*:
+  `_transform_invalidates_metadata` rejects any mismatch or shear above 1e-6,
+  which most real models exceed. A tolerance near 1e-2, or snapping to the
+  nearest rotation, keeps them. `inspect_model` would also be faster with
+  vectorized bounds.
+
 ## Instance selection and body boundaries
 
 The inventory is built from pyldraw3's parsed type-1 placements. Enumerate each
