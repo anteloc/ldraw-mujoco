@@ -45,6 +45,9 @@ RIGID_KINDS = frozenset(
 ROLL_LOCKED = frozenset({SectionShape.AXLE, SectionShape.SQUARE})
 # Deviation of a source matrix from a rotation that still counts as rounding.
 ROUNDING = 1e-2
+# How far mated connectors may be apart (LDU). pyldraw3's default, 0.25, misses
+# rounded placements such as 0.33 LDU in 6399-1; studs are 20 LDU apart.
+TOLERANCE = 0.5
 # Hinge contacts between two bodies share one axis: pyldraw3's 2 degree angular
 # tolerance and 1 LDU (0.4 mm) from the axis line.
 PARALLEL = np.cos(np.radians(2.0))
@@ -86,7 +89,7 @@ def mated_contacts(parts, occurrences, skip=frozenset()):
         diagnostics=(),
         occurrence_count=len(occurrences),
     )
-    return inspection.connection_contacts()
+    return inspection.connection_contacts(tolerance=TOLERANCE)
 
 
 def body_links(contacts, body_of):

@@ -65,9 +65,12 @@ the visual winding. Visual geoms have zero mass and disabled contacts.
 Shell-mode visual meshes support planar patches. A lone triangle is subdivided
 in its plane to satisfy MuJoCo's four-vertex minimum.
 
-Each physical group is a world-parented free body at its original anchor with
-identity initial orientation. The native compiled model is returned alongside
-the editable spec. Changes to the spec take effect on the next compilation.
+Each physical group is a body at its original anchor with identity initial
+orientation. Bodies without mated connectors are world-parented free bodies;
+attached bodies nest under them (see
+[Connections and attachment](#connections-and-attachment)). The native compiled
+model is returned alongside the editable spec. Changes to the spec take effect
+on the next compilation.
 
 `ImportedModel.connections` holds pyldraw3's part-local feature tuples for the
 selected library DATs, keyed by normalized reference. Reports carry coverage
@@ -138,10 +141,10 @@ of sticking:
 
 | Hinge friction setup | 12 cm beam, 4.75 N·mm load, tip travel in 5 s | 106-1 car wheels, rotation in 5 s |
 |---|---|---|
-| Default impedance 0.9 | 72.6 mm | 88–99 mrad |
+| Default impedance 0.9 | 72.6 mm | 87–95 mrad |
 | Default impedance 0.9, `noslip_iterations=10` | 0.0 mm | 86–99 mrad |
-| Impedance 0.999 | 0.73 mm | 0.11 mrad |
-| Impedance 0.9999 (`HARD_FRICTION`) | 0.07 mm | 0.007 mrad |
+| Impedance 0.999 | 0.73 mm | 0.13–0.16 mrad |
+| Impedance 0.9999 (`HARD_FRICTION`) | 0.07 mm | 0.008–0.010 mrad |
 
 The value of the friction above the load made no difference, so the creep
 comes from the soft constraint, not from the friction value. Noslip fixed a
@@ -180,11 +183,25 @@ expanded point in pure Python and took 72 % of its time. `_placed` transforms
 the 8 local box corners instead, because the bounds only guide pyldraw3's
 search for candidate pairs.
 
-| Model | pyldraw3 as is | With the workarounds |
+Matching uses a 0.5 LDU (0.2 mm) tolerance instead of pyldraw3's 0.25 LDU.
+Rounded source positions miss the default: a 1 × 4 plate in 6399-1 sits
+0.33 LDU off its studs. Studs are 20 LDU apart, so the wider tolerance cannot
+pair the wrong stud. It linked 26 more parts in 6399-1, 8 in 10030-1 and none
+in 106-1.
+
+| Model | pyldraw3 as is | With the workarounds and 0.5 LDU |
 |---|---|---|
 | 106-1, 65 parts | 53 contacts, 37 parts connected | 143 contacts, 59 parts connected |
-| 6399-1, 788 parts | not measured | 1,853 contacts, 685 parts connected |
-| 10030-1, 3,037 parts | 97 contacts, 73 parts connected, 42 s | 12,646 contacts, 2,832 parts connected, 27 s |
+| 6399-1, 788 parts | not measured | 1,903 contacts, 711 parts connected |
+| 10030-1, 3,037 parts | 97 contacts, 73 parts connected, 42 s | 12,697 contacts, 2,840 parts connected, 8 s placing + 19–40 s matching |
+
+The 10030-1 matching time varied between runs of the same code.
+
+One gap remains on purpose, because closing it would need matching rules of
+our own. pyldraw3's strict stud check wants the stud's base on the receptacle
+part's bounding-box face. Recessed sockets fail it even when stud and socket
+align exactly, for example 1 × 4 plates mounted sideways (SNOT) onto 6399-1's
+part 2672.
 
 Draft upstream reports (not filed):
 
@@ -240,9 +257,11 @@ input IDs and coordinates when selecting subsets.
 By default, group each physical occurrence by its **immediate containing
 model/submodel instance ID**. A parent owns only its direct DAT parts. Its
 child submodels own their direct parts separately, recursively. Loose root
-parts form the root's own group. All resulting bodies have world parents and
-free joints: the LDraw tree is source organization, not a MuJoCo body tree.
-No equality constraints or inter-body welds are introduced.
+parts form the root's own group. The LDraw tree is source organization, not a
+MuJoCo body tree: bodies nest only by their mated connectors (see
+[Connections and attachment](#connections-and-attachment)). With
+`attach=False` / `--no-attach`, every body is a world-parented free body and no
+constraints are introduced.
 
 `individual_parts=True` / `--individual-parts` instead groups by each physical
 part occurrence ID. This single boolean applies to the whole selection; there
@@ -333,10 +352,45 @@ Deferred:
 ## Verification and reproduction
 
 106-1 has 65 physical occurrences across 36 part references. Default import
-produces seven free bodies: 45 direct car parts, five two-part wheels, and ten
-minifigure parts. Thus `nq=49`, `nv=42`, `nbody=8` including the world. The car
-selection includes six bodies; one selected wheel instance includes one.
-Individual-parts mode produces 65 bodies for the complete input.
+produces seven bodies: 45 direct car parts, five two-part wheels, and ten
+minifigure parts. The wheels hinge on the car's wheel pins and the minifigure
+stands free, so `nq=19`, `nv=17`, `nbody=8` including the world (`nq=49`,
+`nv=42` with `--no-attach`). The car selection includes six bodies; one
+selected wheel instance includes one. Individual-parts mode produces 65 bodies
+for the complete input: 8 free roots, 47 rigid children and 10 hinges.
+
+Hold verdicts for 106-1, before and after attachment:
+
+| Scene | Before | Attached |
+|---|---|---|
+| Full model (default) | crumbles: spare wheel `0/19` fell | holds 5 s, at most 0.02 mm |
+| Car only | crumbles: spare wheel fell | holds 5 s |
+| Individual parts | crumbles: 18 bodies within 10 ms | 1 body: the scaled left arm `1/5`, which has no connectors |
+
+After 2 s of `simulate`, the attached individual parts keep the car and the
+minifigure together; only the scaled arms and hands lie on the ground. The
+unattached parts collapse (44 versus 251 final contacts).
+
+The 10,000 spaced bricks of `examples/repeated_bricks.py` have no mates, so
+they stay free bodies. Placing and matching their connectors adds 8 s to the
+import (105 s versus 97 s) and 50 MiB peak memory (445 versus 395 MiB).
+
+6399-1, 788 individual parts, `--solver cg`, `hold` for 5 s:
+
+| | Attached | `--no-attach` |
+|---|---|---|
+| Import | 19.0 s | 14.7 s |
+| Bodies | 136 free roots, 74 hinges, 9 loops | 788 free bodies |
+| DoFs (nv) | 890 | 4,728 |
+| Contacts at import | 1,662 | 8,092 |
+| Verdict | crumbles: 39 bodies moved | crumbles: 440 bodies moved |
+| Check wall time | 3.3 s | 11.9 s |
+
+Of the 39 attached movers, 11 are among the 77 parts without a confirmed mate,
+for example grille tiles (2412b). The other 28 are attached: 9 roots of small
+groups, 13 parts rigidly attached to them, and 6 hinged parts. With welded
+submodels, attachment nests one body; the one submodel that falls does so in
+both modes during the settle window (18 mm).
 
 ```sh
 uv sync --locked
@@ -357,9 +411,22 @@ child bodies, primitive/embedded DAT boundaries, standalone inputs, winding,
 planar color patches, missing/cyclic references, stud-free hulls with studded
 visuals, and the solver, multiccd and margin options in the XML round trip.
 Hold tests cover a resting part, a falling part with and without settling, a
-tipping body, invalid arguments and the CLI exit code. Integration tests verify
-sample counts, positive mass/inertia, XML round trips and that the sample gets
-a valid verdict. They do not require the sample to hold.
+tipping body, invalid arguments and the CLI exit code. Connection tests use
+synthetic parts with LDCad shadow metas:
+
+- stacked plates attach rigidly, including with rounded rotations and square
+  sockets
+- a pin in a hole gives a hinge with hard friction and the expected axis
+- one pin between two submodels is a hinge, two pins are rigid
+- two pins through two beams close a loop that holds in the imported pose and
+  survives the XML round trip
+- an overhanging plate holds only when attached
+- the CLI options, and `forest()`'s ordering, loops and roots
+
+Integration tests verify sample counts, the car's five wheel hinges, positive
+mass/inertia, XML round trips (world poses under identical forces), the
+individual-parts attachments of tyres, rims and minifigure legs, and that the
+sample gets a valid verdict.
 
 MuJoCo rounds inline XML numbers. Round-trip tests compare geometry to 0.1
 micrometer, mass/inertia within serialization tolerances, and free-flight
@@ -370,7 +437,7 @@ symmetric mesh principal-axis frames may differ after compilation, so compare
 world geometry rather than those internal frames.
 
 For MCP verification, validate and load the XML, inspect `scene_map` and the
-free joints, and step briefly to confirm the artifact runs. The local renderer
+joints, and step briefly to confirm the artifact runs. The local renderer
 supplies inspection images when MCP rendering is unavailable. MCP is optional
 for ordinary package use. Use `hold` for the verdict, not the MCP stability
 tools: its tolerance, settle window and report are the project's convention.
@@ -380,40 +447,47 @@ tools: its tolerance, settle window and report are the project's convention.
 The reference work established several useful boundaries: use pyldraw3 instead
 of another parser; preserve library/source attribution; distinguish physical
 leaves from geometric primitives; and keep connector evidence, geometry,
-collision approximations and physical strength as separate claims. LDCad female
-socket frame conventions and pyldraw3 1.7's inferred connector classifications
-need care before connection matching is used to create joints. No matching
-heuristics or uncalibrated attachment forces have been added here.
+collision approximations and physical strength as separate claims. Attachment
+now follows pyldraw3's confirmed matches only. The LDCad socket conventions
+that needed care are handled by the documented workarounds; no matching
+heuristics of our own have been added.
 
 The Technic reference demonstrated rigid grouping and representing articulated
-mechanisms with body trees and equality constraints. Those mechanisms are a
-later extension. Its reflection mapping and hand-written approximate inertia
-formulas were not carried into this importer.
+mechanisms with body trees and equality constraints. Attachment uses the same
+structure. Its reflection mapping and hand-written approximate inertia formulas
+were not carried into this importer.
 
 Use `examples/repeated_bricks.py` to reproduce the 10,000-body asset-sharing
 check in a fresh process. Its timing covers source loading through native model
 compilation. Peak resident memory includes constructing the data and taking one
 step with spaced bricks. Dense contact workloads need separate measurements.
 
-Keep the single parts/welded flag for future changes. Mixed per-instance
-modes, support contexts, attachments and articulated mechanisms are deferred
-until explicitly requested.
+Keep the single parts/welded flag and the single `attach` flag for future
+changes. Mixed per-instance modes and support contexts are deferred until
+explicitly requested.
 
-The next step for meaningful verdicts is clutch. In real LEGO, a stud holds
-only inside a hollow receptacle (shear interlock) plus clutch, in any
-orientation, including SNOT side studs. A filled convex hull has no hollow, so
-studs cannot be represented there. Two options, to be decided before work
-starts:
+Attachment was the chosen answer to clutch. Studs that pyldraw3 confirms as
+mated, in any orientation including SNOT, now hold their parts rigidly.
+Convex decomposition with hollow receptacles was the alternative; it remains
+unneeded. Next steps, in order of expected value:
 
-- Constraints between parts that pyldraw3's connection graph says are
-  connected. The graph already detects top and side studs with their frames.
-  This reverses the "no attachment inference" rule.
-- Convex decomposition with hollow receptacles. This gives geometric interlock
-  without inference, but adds a dependency and many more contacts.
+- **Breakable clutch.** Rigid links never break. To limit them, turn a link
+  into a `weld` equality constraint and deactivate it (`eq_active`) when its
+  force exceeds a clutch limit. Set the weld's `data` explicitly: MjSpec's
+  default puts the anchor at (0, 1, 0), 1 m away.
+- **Per-part friction.** One friction torque serves all joints, so the car's
+  wheels need a push to roll while some heavy arms may still swing. Free
+  wheels versus friction pins would need part-level data, which the connector
+  metadata does not carry.
+- **Slides.** LDCad's `slide` is ignored. Slide joints need axial limits from
+  the overlap of the mated features, or a part slides out of its hole.
+- **Faster matching.** pyldraw3's matcher is pure Python: 19–40 s for 3,000
+  parts. `--no-attach` skips it.
+- **Upstream fixes** for the three pyldraw3 gaps (drafts above). Each fix lets
+  one workaround in `connections.py` go.
 
-Calibrating contacts (stiffer `solref`, zero clearance) belongs with either
-option, so that settling stays well below the tolerance and the settle window
-can shrink.
+Calibrating contacts (stiffer `solref`, zero clearance) still lets settling
+stay well below the tolerance, so that the settle window can shrink.
 
 The ID convention comes from Carlos Antelo's
 [ldraw-mecha](https://github.com/anteloc/ldraw-mecha) documentation (2026,

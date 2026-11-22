@@ -39,7 +39,7 @@ CONTACT_MARGIN = 0.0002
 JOINTS = {"hinge": mujoco.mjtJoint.mjJNT_HINGE, "ball": mujoco.mjtJoint.mjJNT_BALL}
 # Joint friction holds a pose only as a hard constraint. At MuJoCo's default
 # impedance (0.9) a loaded hinge creeps (a 12 cm beam's tip: 72 mm in 5 s, and
-# 106-1's wheels turned 0.09 rad); at its maximum, 0.9999, 0.07 mm and 7 µrad.
+# 106-1's wheels turned 0.09 rad); at its maximum, 0.9999, 0.07 mm and 10 µrad.
 HARD_FRICTION = [0.9999, 0.9999, 0.001, 0.5, 2]
 
 
