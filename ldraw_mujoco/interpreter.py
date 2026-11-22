@@ -81,6 +81,10 @@ class Interpreter:
         for occurrence in self.report["occurrences"]:
             ident, body = occurrence["id"], model.body(occurrence["body"])
             joint = int(body.jntadr[0])
+            if body.jntnum[0] != 1 or model.jnt_type[joint] != mujoco.mjtJoint.mjJNT_FREE:
+                raise ValueError(
+                    "Execution requires one free body per part; import with attach=False"
+                )
             qa, va = int(model.jnt_qposadr[joint]), int(model.jnt_dofadr[joint])
             self.parts[ident] = {
                 "body": body.name,
@@ -122,6 +126,7 @@ class Interpreter:
             "friction": options["sliding_friction"],
             "timestep": options["timestep_s"],
             "clearance": options["ground_clearance_m"],
+            "solver": options["solver"],
         }
         self.client = None
         self.enabled = []
@@ -156,16 +161,19 @@ class Interpreter:
     ):
         """Convert the source and own a stdio server until the context exits.
 
-        Import options are those of ``import_ldraw``, except selection/grouping.
+        Import options are those of ``import_ldraw``, except selection/grouping and
+        attachment: every part is its own free body (``attach=False``).
         ``output_dir`` saves the exact XML, reports and a flushed JSONL event log.
         ``viewer=True`` opens an independent browser viewer and paces connected playback.
         A failed window launch is recorded in ``viewer_error``; execution remains available.
         """
-        if {"sections", "individual_parts"} & import_options.keys():
-            raise ValueError("The interpreter always executes the full input as individual parts")
+        if {"sections", "individual_parts", "attach"} & import_options.keys():
+            raise ValueError(
+                "The interpreter always executes the full input as individual free parts"
+            )
         started = time.monotonic()
         print("Importing and compiling LDraw geometry…", file=sys.stderr)
-        imported = import_ldraw(path, individual_parts=True, **import_options)
+        imported = import_ldraw(path, individual_parts=True, attach=False, **import_options)
         imported_at = time.monotonic()
         print("Preparing execution model…", file=sys.stderr)
         program = cls(
@@ -298,6 +306,7 @@ class Interpreter:
                 imported = import_ldraw(
                     self.report["source"],
                     individual_parts=True,
+                    attach=False,
                     placement_overrides=overrides,
                     **self._import_options,
                 )
@@ -511,9 +520,9 @@ class Interpreter:
         self._busy = True
         try:
             if checkpoint["command"] == "edit":
-                imported = ImportedModel(
-                    mujoco.MjSpec.from_string(checkpoint["xml"]), checkpoint["report"]
-                )
+                spec = mujoco.MjSpec.from_string(checkpoint["xml"])
+                # Execution never attaches parts, so it needs no connector features.
+                imported = ImportedModel(spec, checkpoint["report"], spec.compile(), {})
                 await self._replace_scene(
                     imported, checkpoint, self._history[:-1], restore_state=True
                 )

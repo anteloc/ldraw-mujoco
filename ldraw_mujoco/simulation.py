@@ -1,7 +1,8 @@
-"""Small simulation reports and local snapshots using MuJoCo's own APIs."""
+"""Hold checks, simulation reports, static views and snapshots using MuJoCo's own APIs."""
 
 from __future__ import annotations
 
+import itertools
 import math
 import sys
 import time
@@ -97,7 +98,8 @@ def _simulate(model, *, seconds=5.0, data=None, handle=None):
                 valid = False
                 failures.append("Non-finite state or simulation time reset")
                 break
-            mujoco.mj_forward(model, data)
+            # Positions and contacts come from the start of the step: one step behind
+            # qpos, which avoids a second, equally expensive mj_forward per step.
             max_contacts = max(max_contacts, data.ncon)
             if data.ncon:
                 max_penetration = max(max_penetration, float(max(0, -data.contact.dist.min())))
@@ -126,6 +128,8 @@ def _simulate(model, *, seconds=5.0, data=None, handle=None):
                     time.sleep(max(0, target - (time.monotonic() - wall_start)))
     finally:
         _display(handle, data, "Finished" if valid else "Stopped: invalid physics")
+    if valid:
+        mujoco.mj_forward(model, data)  # mj_step leaves positions one step behind qpos.
     warnings = {
         mujoco.mjtWarning(i).name: int(w.number) for i, w in enumerate(data.warning) if w.number
     }
@@ -154,6 +158,137 @@ def _simulate(model, *, seconds=5.0, data=None, handle=None):
     }
 
 
+# Signs of a box's eight corners, used to follow each geom's bounding box.
+_CORNERS = np.array(list(itertools.product((-1, 1), repeat=3)))
+
+
+def _corners(model, data, geoms):
+    """World positions of the local bounding-box corners of ``geoms``: (n, 8, 3)."""
+    local = model.geom_aabb[geoms, None, :3] + _CORNERS * model.geom_aabb[geoms, None, 3:]
+    rotation = data.geom_xmat[geoms].reshape(-1, 3, 3)
+    return data.geom_xpos[geoms, None] + local @ rotation.transpose(0, 2, 1)
+
+
+def _displacement(model, geoms, before, after):
+    """Largest corner displacement per body, indexed by body ID."""
+    result = np.zeros(model.nbody)
+    np.maximum.at(
+        result, model.geom_bodyid[geoms], np.linalg.norm(after - before, axis=2).max(axis=1)
+    )
+    return result
+
+
+def hold(model, *, seconds=5.0, tolerance=0.002, settle=0.2, data=None):
+    """Check that no body moves more than ``tolerance`` meters for ``seconds``.
+
+    Contacts are soft: a scene first drops its import clearance and sinks into
+    its contacts. The first ``settle`` seconds are reported, not judged. Then,
+    every 10 ms of simulated time, each body's movement is the largest
+    displacement of any corner of its colliding geoms' bounding boxes. The run
+    stops at the first body that moved too far. Returns (MjData, report).
+    """
+    if not (math.isfinite(seconds) and seconds > 0 and math.isfinite(tolerance) and tolerance > 0):
+        raise ValueError("seconds and tolerance must be finite and positive")
+    if not (math.isfinite(settle) and settle >= 0):
+        raise ValueError("settle must be finite and non-negative")
+    data = mujoco.MjData(model) if data is None else data
+    # Physical shapes: geoms that collide, on bodies that can move.
+    geoms = np.flatnonzero(
+        (model.geom_bodyid > 0) & ((model.geom_contype | model.geom_conaffinity) > 0)
+    )
+    timestep = model.opt.timestep
+    check = max(1, round(0.01 / timestep))
+    wall = time.perf_counter()
+    mujoco.mj_forward(model, data)
+    initial = _corners(model, data, geoms)
+    for _ in range(math.ceil(settle / timestep)):
+        mujoco.mj_step(model, data)
+    mujoco.mj_forward(model, data)
+    start, held_from = _corners(model, data, geoms), float(data.time)
+    settled = _displacement(model, geoms, initial, start)
+    moved = np.zeros(model.nbody)
+    steps = math.ceil(seconds / timestep)
+    for step in range(1, steps + 1):
+        mujoco.mj_step(model, data)
+        if step % check and step < steps:
+            continue
+        # MuJoCo warns, then resets the state, when a simulation becomes unstable.
+        if any(w.number for w in data.warning) or not np.isfinite(data.qpos).all():
+            break
+        moved = np.maximum(moved, _displacement(model, geoms, start, _corners(model, data, geoms)))
+        if moved.max() > tolerance:
+            break
+    warnings = {
+        mujoco.mjtWarning(i).name: int(w.number) for i, w in enumerate(data.warning) if w.number
+    }
+    valid = not warnings and bool(np.isfinite(data.qpos).all())
+    if valid:
+        mujoco.mj_forward(model, data)  # mj_step leaves positions one step behind qpos.
+    movers = np.flatnonzero(moved > tolerance)
+    movers = movers[np.argsort(-moved[movers])]
+    worst = int(settled.argmax())
+    return data, {
+        "holds": valid and not len(movers),
+        "seconds": seconds,
+        "settle_s": settle,
+        "tolerance_m": tolerance,
+        "held_s": float(data.time) - held_from,
+        "wall_s": time.perf_counter() - wall,
+        "solver": mujoco.mjtSolver(model.opt.solver).name.removeprefix("mjSOL_").lower(),
+        "settle_displacement_m": float(settled[worst]),
+        "settle_body": model.body(worst).name,
+        "max_displacement_m": float(moved.max()),
+        "moved_bodies": [
+            {"name": model.body(i).name, "displacement_m": float(moved[i])} for i in movers
+        ],
+        "numerically_valid": valid,
+        "warnings": warnings,
+        "interpretation": "Holds means no body moved more than the tolerance after settling, "
+        "under approximate physics: parts stay together only through the imported "
+        "attachments (rigid links without clutch limits, joints with uncalibrated friction); "
+        "studs alone give no interlock, and contacts are soft. "
+        "Falls that end within the settle window are only reported. "
+        "Not proof of physical stability.",
+    }
+
+
+def _frame(model, data, selected, azimuth=135, elevation=-25):
+    """A free camera framing the bounding spheres of the selected geoms."""
+    centers = data.geom_xpos[selected]
+    radii = model.geom_rbound[selected, None]
+    low, high = (centers - radii).min(axis=0), (centers + radii).max(axis=0)
+    camera = mujoco.MjvCamera()
+    camera.lookat = (low + high) / 2
+    camera.distance = max(float(np.linalg.norm(high - low)) * 1.4, 0.05)
+    camera.azimuth, camera.elevation = azimuth, elevation
+    return camera
+
+
+def show(model, data, *, highlight=()):
+    """View ``data`` in MuJoCo's viewer without stepping; tint ``highlight`` bodies red.
+
+    Returns when the window closes. On macOS, run under ``mjpython``.
+    """
+    from mujoco import viewer
+
+    original = model.geom_rgba.copy()
+    bodies = [model.body(name).id for name in highlight]
+    visuals = model.geom_group == 0
+    model.geom_rgba[np.isin(model.geom_bodyid, bodies) & visuals] = (0.9, 0.1, 0.1, 1)
+    try:
+        with viewer.launch_passive(model, data) as handle:
+            # Start with the whole model in view, like snapshot().
+            frame = _frame(model, data, (model.geom_bodyid != 0) & visuals)
+            with handle.lock():
+                handle.cam.lookat[:] = frame.lookat
+                handle.cam.distance = frame.distance
+                handle.cam.azimuth, handle.cam.elevation = frame.azimuth, frame.elevation
+            while handle.is_running():
+                time.sleep(0.1)
+    finally:
+        model.geom_rgba[:] = original
+
+
 def snapshot(model, data, path, *, body=None, azimuth=135, elevation=-25, width=1000, height=750):
     """Render all bodies or one named assembly; collision geometry stays hidden."""
     path = Path(path)
@@ -164,13 +299,7 @@ def snapshot(model, data, path, *, body=None, azimuth=135, elevation=-25, width=
     selected &= model.geom_group == 0
     if not selected.any():
         raise ValueError(f"No visual geometry to render for {body or 'scene'}")
-    centers = data.geom_xpos[selected]
-    radii = model.geom_rbound[selected, None]
-    low, high = (centers - radii).min(axis=0), (centers + radii).max(axis=0)
-    camera = mujoco.MjvCamera()
-    camera.lookat = (low + high) / 2
-    camera.distance = max(float(np.linalg.norm(high - low)) * 1.4, 0.05)
-    camera.azimuth, camera.elevation = azimuth, elevation
+    camera = _frame(model, data, selected, azimuth, elevation)
     options = mujoco.MjvOption()
     options.geomgroup[3:] = 0
     original_groups = model.geom_group.copy()

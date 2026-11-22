@@ -1,4 +1,4 @@
-"""Inspect source instances, convert an LDraw input, or simulate its MJCF."""
+"""Inspect source instances, convert or execute an LDraw input, or check/simulate its MJCF."""
 
 from __future__ import annotations
 
@@ -10,8 +10,8 @@ from pathlib import Path
 
 import mujoco
 
-from .importer import import_ldraw, inspect_ldraw
-from .simulation import _simulate, snapshot
+from .importer import SOLVERS, import_ldraw, inspect_ldraw
+from .simulation import _simulate, hold, show, snapshot
 
 
 def write_json(path, report):
@@ -54,7 +54,24 @@ def main(argv=None):
     convert.add_argument(
         "--individual-parts",
         action="store_true",
-        help="One independent free body per placed DAT part, never per geometric subpart",
+        help="One body per placed DAT part, never per geometric subpart",
+    )
+    convert.add_argument(
+        "--no-attach",
+        action="store_true",
+        help="Leave every body free instead of attaching bodies by their mated connectors",
+    )
+    convert.add_argument(
+        "--joint-friction",
+        type=float,
+        default=0.01,
+        help="Friction torque of pin, clip, hinge and ball joints in N·m; 0 lets them swing",
+    )
+    convert.add_argument(
+        "--solver",
+        choices=SOLVERS,
+        default="newton",
+        help="Constraint solver; use cg for thousands of touching individual parts",
     )
     execute = commands.add_parser("execute", help="Debug type-1 placements through MuJoCo MCP")
     execute.add_argument("input", type=Path)
@@ -63,6 +80,23 @@ def main(argv=None):
     execute.add_argument("--output-dir", type=Path, help="Default: output/INPUT_STEM/execution")
     execute.add_argument(
         "--viewer", action="store_true", help="Open an independent browser inspection viewer"
+    )
+    check = commands.add_parser("hold", help="Check once that an MJCF scene holds still")
+    check.add_argument("input", type=Path)
+    check.add_argument("--seconds", type=float, default=5, help="How long it must hold")
+    check.add_argument("--tolerance", type=float, default=0.002, help="Meters any body may move")
+    check.add_argument(
+        "--settle",
+        type=float,
+        default=0.2,
+        help="Initial seconds reported but not judged (clearance drop, contact settling)",
+    )
+    check.add_argument("--report", type=Path, help="Default: INPUT.hold.json")
+    check.add_argument("--snapshot", type=Path, help="Save the final scene as PNG")
+    check.add_argument(
+        "--viewer",
+        action="store_true",
+        help="Then show the result, moved bodies in red, without stepping; mjpython on macOS",
     )
     run = commands.add_parser("simulate", help="Simulate MJCF and report approximate behavior")
     run.add_argument("input", type=Path)
@@ -88,11 +122,14 @@ def main(argv=None):
                 library=args.library,
                 shadows=[] if args.no_shadow else args.shadow,
                 individual_parts=args.individual_parts,
+                attach=not args.no_attach,
                 sections=args.section,
                 density=args.density,
                 friction=args.friction,
+                joint_friction=args.joint_friction,
                 timestep=args.timestep,
                 clearance=args.clearance,
+                solver=args.solver,
             )
             xml = result.spec.to_xml()
             # Check the artifact the user will actually load, before writing it.
@@ -106,6 +143,26 @@ def main(argv=None):
                 f"Wrote {args.output} and {report_path}: "
                 f"{result.report['occurrence_count']} occurrences, {len(result.report['bodies'])} rigid bodies"
             )
+        elif args.command == "hold":
+            model = mujoco.MjModel.from_xml_path(str(args.input.resolve()))
+            data, report = hold(
+                model, seconds=args.seconds, tolerance=args.tolerance, settle=args.settle
+            )
+            report_path = args.report or args.input.with_suffix(".hold.json")
+            write_json(report_path, report)
+            if args.snapshot:
+                snapshot(model, data, args.snapshot)
+            moved = [body["name"] for body in report["moved_bodies"]]
+            verdict = "holds" if report["holds"] else f"crumbles ({len(moved)} bodies moved)"
+            if not report["numerically_valid"]:
+                verdict = f"is numerically invalid: {report['warnings']}"
+            print(
+                f"{args.input.name} {verdict} after {report['held_s']:.2f} s "
+                f"({report['wall_s']:.1f} s wall). Wrote {report_path}"
+            )
+            if args.viewer:
+                show(model, data, highlight=moved)
+            return 0 if report["holds"] else 1
         else:
             from .viewer import browser_session
 

@@ -272,8 +272,9 @@ def test_inspect_and_select_cli(tmp_path, small_library, capsys):
     ],
 )
 def test_sample_selection(sample, sections, individual_parts, count, bodies):
+    # Selection only: attachment would nest bodies and change the joint counts.
     result = import_ldraw(
-        sample.report["source"], sections=sections, individual_parts=individual_parts
+        sample.report["source"], sections=sections, individual_parts=individual_parts, attach=False
     )
     model = result.spec.compile()
     assert result.report["occurrence_count"] == count

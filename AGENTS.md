@@ -14,8 +14,10 @@ physical modeling decision cannot be resolved from the task and evidence.
 4. `uv run ruff check .` checks maintained code. Source data is excluded.
 
 Use `ldraw_mujoco.import_ldraw()` or the `ldraw-mujoco convert` command to build
-models. Use native MuJoCo APIs after compilation. Keep parsing/geometry,
-physics construction and simulation/reporting separate; no second backend.
+models, and `hold()` or `ldraw-mujoco hold` to check them once, headless. View
+results with `show()` or `--viewer`, which never step physics. Use native
+MuJoCo APIs after compilation. Keep parsing/geometry, physics construction and
+simulation/reporting separate; no second backend.
 
 ## Conventions that must stay explicit
 
@@ -36,21 +38,41 @@ physics construction and simulation/reporting separate; no second backend.
   selectors in ambiguity errors. Keep raw path IDs in inventories and reports.
   Preserve full-input transforms, inherited colors and BFC ownership.
 - Default welding groups only the direct DAT parts of each model/submodel
-  instance. Child submodels are independent world-parented free bodies; never
-  weld them to ancestors or siblings. Containers without direct parts have IDs
-  but no empty physics body. Root loose parts share the root's own body.
+  instance. Child submodels are bodies of their own; sections never weld or
+  attach them to ancestors or siblings. Containers without direct parts have
+  IDs but no empty physics body. Root loose parts share the root's own body.
 - `individual_parts=True` / `--individual-parts` is the only grouping switch,
-  applied to the entire import. Each physical DAT occurrence gets a free body;
-  geometric subparts/primitives stay inside it. Do not restore grouping modes,
-  per-instance overrides, stability workflows or attachment inference.
+  applied to the entire import. Each physical DAT occurrence gets a body;
+  geometric subparts/primitives stay inside it. Do not restore grouping modes
+  or per-instance overrides.
+- Attachment (`attach=True`, default; `--no-attach` turns it off) follows only
+  contacts pyldraw3 confirms (`connections.py`). Studs, tyres and axles in axle
+  holes nest a body without a joint; pins, clips and hinge fingers give hinges,
+  free generic connectors ball joints; joint loops give `connect` equalities
+  plus excludes. Rigid links go first, so rigid clusters are exact. Never add
+  matching heuristics of our own; the three pyldraw3 1.7.0 workarounds are
+  documented and go when upstream fixes them. Matching tolerates 0.5 LDU of
+  CAD rounding. LDCad `slide` is ignored.
+- Joint friction is one uncalibrated torque (`joint_friction`, 0.01 N·m) and
+  must stay a hard constraint (`solimpfriction` 0.9999), or held poses creep.
+- The hold check is the one stability workflow: settle (0.2 s), then stop at
+  the first body that moves beyond the tolerance (2 mm) within the duration
+  (5 s). Run it once, headless. Never step large scenes in
+  `mujoco.viewer.launch`: it runs physics continuously, even when paused.
+  `--solver cg` suits thousands of touching individual parts; Newton the rest.
 - Keep affine source transforms in mesh vertices. Never turn scale/shear into
   a quaternion silently. Preserve BFC winding and mirrored transforms.
 - Visual surfaces have zero mass and no contacts. Group 3 geoms are collision
   hulls and the sole source of inferred mass/inertia; group 0 is visual.
-- Hulls fill cavities and can overlap. Density and friction are assumptions.
-  Numerical success does not prove attachment strength or real-world stability.
+- Hulls omit stud primitives (pyldraw3's `stud` file-stem rule) and fill
+  cavities; CAD interpenetrations (pins, clips, minifig joints) can still
+  overlap. Hull contacts use multiccd and a 0.2 mm margin so flat faces rest on
+  each other. Density, friction and the margin are assumptions. Mated studs
+  hold rigidly in any orientation, SNOT included, and never break; a stud
+  without a confirmed mate gives no interlock. Numerical success does not
+  prove attachment strength or real-world stability.
 - Shadow coverage/warnings are separate from solid geometry completeness.
-  Do not treat inferred connectors as calibrated joints or clutch forces.
+  Do not treat attachments as calibrated joints or clutch forces.
 
 ## Files and evidence
 
