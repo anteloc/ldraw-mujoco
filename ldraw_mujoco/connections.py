@@ -10,9 +10,9 @@ MuJoCo bodies and joints.
 from __future__ import annotations
 
 import itertools
-from collections import deque
 from dataclasses import dataclass, replace
 
+import networkx as nx
 import numpy as np
 from ldraw import (
     ConnectionContact,
@@ -29,6 +29,7 @@ from ldraw import (
     Vector,
 )
 from ldraw.inspection import transformed_bounds
+from networkx.utils import UnionFind
 
 from .geometry import normalized, vector
 
@@ -121,39 +122,26 @@ def forest(count, links):
     parents first; roots have ``parent`` and ``link`` set to ``None``. ``loops``
     lists ``(a, b, link)``.
     """
-    joined, rigid = list(range(count)), list(range(count))  # Union-find parents.
-
-    def find(sets, i):
-        while sets[i] != i:
-            sets[i] = sets[sets[i]]
-            i = sets[i]
-        return i
-
-    neighbours = [[] for _ in range(count)]
+    # Kruskal's algorithm in an explicit, deterministic order: rigid first, then by pair.
+    joined, rigid = UnionFind(range(count)), UnionFind(range(count))
+    graph = nx.Graph()
+    graph.add_nodes_from(range(count))
     loops = []
     for (a, b), link in sorted(links.items(), key=lambda item: (PRIORITY[item[1].kind], item[0])):
-        if find(joined, a) != find(joined, b):
-            joined[find(joined, a)] = find(joined, b)
+        if joined[a] != joined[b]:
+            joined.union(a, b)
             if link.kind == "rigid":
-                rigid[find(rigid, a)] = find(rigid, b)
-            neighbours[a].append((b, link))
-            neighbours[b].append((a, link))
-        elif find(rigid, a) != find(rigid, b):
+                rigid.union(a, b)
+            graph.add_edge(a, b, link=link)
+        elif rigid[a] != rigid[b]:
             loops.append((a, b, link))
-    tree, seen = [], set()
-    for root in range(count):
-        if root in seen:
-            continue
-        seen.add(root)
+    tree = []
+    for root in sorted(min(component) for component in nx.connected_components(graph)):
         tree.append((root, None, None))
-        queue = deque([root])
-        while queue:
-            body = queue.popleft()
-            for other, link in neighbours[body]:
-                if other not in seen:
-                    seen.add(other)
-                    tree.append((other, body, link))
-                    queue.append(other)
+        tree.extend(
+            (child, parent, graph.edges[parent, child]["link"])
+            for parent, child in nx.bfs_edges(graph, root)
+        )
     return tree, loops
 
 

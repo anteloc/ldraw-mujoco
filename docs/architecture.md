@@ -87,6 +87,15 @@ the visual winding. Visual geoms have zero mass and disabled contacts.
 Shell-mode visual meshes support planar patches. A lone triangle is subdivided
 in its plane to satisfy MuJoCo's four-vertex minimum.
 
+Part geoms use two MJCF default classes, so the exported XML states each
+assumption once. `collision` holds the hull settings: group 3, density,
+sliding friction, condim and the contact margin. `visual` holds group 0 and
+disabled contacts. Each visual geom still carries `mass="0"` itself. MuJoCo
+3.5's XML writer drops a zero mass or density from a default class and never
+saves `compiler/inertiagrouprange`. Without the per-geom zero mass, a
+reloaded scene would weigh visuals at density 1000. The XML round-trip test
+catches this.
+
 Each physical group is a body at its original anchor with identity initial
 orientation. Bodies without mated connectors are world-parented free bodies;
 attached bodies nest under them (see
@@ -99,9 +108,14 @@ selected library DATs, keyed by normalized reference. Reports carry coverage
 and diagnostics once per reference. Document-local DATs take precedence over
 library names for geometry and retain explicit unqueried connector coverage.
 
-`import_ldraw` works in three phases. It places every occurrence and registers
-its meshes, links bodies by their mated connectors (`connections.py`), and only
-then builds bodies, parents first, adding each occurrence's geoms. Body
+`import_ldraw` works in three phases:
+
+1. `_place` places every occurrence and registers its meshes.
+2. `connections.py` links bodies by their mated connectors.
+3. `_build_bodies` builds the bodies, parents first, adding each
+   occurrence's geoms.
+
+The rest of `import_ldraw` assembles the report. Body
 creation waits because a body's parent depends on the connections of all
 parts.
 
@@ -132,7 +146,8 @@ All contacts between two bodies combine into one link:
 - Balls must share one center. A ball on a hinge axis leaves the hinge.
 - Anything else is rigid. Two pins on different axes lock two beams together.
 
-`connections.forest` picks the body trees with Kruskal's algorithm, taking
+`connections.forest` picks the body trees with Kruskal's algorithm, using
+networkx's `UnionFind` and `bfs_edges` in an explicit link order, and taking
 rigid links first. Rigidly connected bodies therefore form exactly rigid
 clusters. A rigid link never closes a loop, and a joint inside one cluster is
 locked and dropped. A joint between clusters that other links already join
@@ -306,10 +321,12 @@ never runs physics.
 three steps:
 
 1. It steps through the settle window. The displacement there is reported as
-   `settle_displacement_m` and `settle_body`, but not judged.
+   `settle_displacement_m` and `settle_body` (`null` when nothing moved), but
+   is not judged.
 2. It takes the settled pose as the reference. Every 10 ms of simulated time,
-   it measures each body's largest displacement of any corner of its colliding
-   geoms' bounding boxes (`geom_aabb`), so rotations count.
+   which is one `mj_step(model, data, nstep=…)` call, it measures each body's
+   largest displacement of any corner of its colliding geoms' bounding boxes
+   (`geom_aabb`), so rotations count.
 3. It stops at the first body beyond the tolerance, or after `seconds`.
 
 `show(model, data, highlight=...)` opens `mujoco.viewer.launch_passive` on the
@@ -488,6 +505,22 @@ Keep the single parts/welded flag and the single `attach` flag for future
 changes. Source execution is a separate layer on the importer, described
 [below](#interpreter-and-mcp-execution). Mixed per-instance modes and support contexts are deferred until
 explicitly requested.
+
+A cleanup pass on 2026-11-25 left behaviour unchanged: reports, hold
+verdicts and compiled models were identical for every 106-1 scene. It
+changed four things:
+
+- the code reuses networkx and the `nstep` stepping of MuJoCo's Python
+  bindings;
+- geoms use default classes;
+- `import_ldraw` is split into phases;
+- pyldraw3 pieces and models are keyed by identity instead of `id()`.
+
+The interpreter was out of scope. Its `_replace_scene` still swaps state
+with `self.__dict__.update(candidate.__dict__)`. Moving the per-scene state
+(XML, model, masks, slot, preparation) into a small `Scene` object would make
+edit and undo swap one attribute. That change needs the interpreter tests to
+stop reaching into private members.
 
 Attachment was the chosen answer to clutch. Studs that pyldraw3 confirms as
 mated, in any orientation including SNOT, now hold their parts rigidly.

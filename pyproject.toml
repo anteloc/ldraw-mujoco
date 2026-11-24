@@ -46,7 +46,7 @@ markers = ["integration: requires local sample data or optional interpreter depe
 
 [tool.ruff]
 line-length = 100
-extend-exclude = ["data", "output"]
+extend-exclude = ["data", "output", ".agents", ".claude"]
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F", "I"]

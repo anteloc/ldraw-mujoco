@@ -7,14 +7,20 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
-import trimesh
 from ldraw import Colour, Model, Piece, read_model
 from ldraw.errors import PartError, PartNotFoundError
 from ldraw.lines import Comment, MetaCommand, Quadrilateral, Triangle
 
+from .editing import validate_placement
+
 LDU_TO_METERS = 0.0004
 # A proper rotation: determinant +1, LDraw -Y becomes MuJoCo +Z.
 BASIS = np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]], dtype=float)
+
+
+def to_mujoco(point):
+    """An LDraw point in LDU as a MuJoCo point in meters: ``0.0004 * (x, z, -y)``."""
+    return BASIS @ point * LDU_TO_METERS
 
 
 def normalized(name):
@@ -23,6 +29,11 @@ def normalized(name):
 
 def vector(v):
     return np.array([v.x, v.y, v.z], dtype=float)
+
+
+def within(instance_id, ancestor):
+    """Whether an occurrence ID is ``ancestor`` itself or one of its descendants."""
+    return instance_id == ancestor or instance_id.startswith(ancestor + "/")
 
 
 def is_stud(reference):
@@ -45,7 +56,7 @@ def inverted_pieces(objects):
             pending = True
         elif isinstance(obj, Piece):
             if pending:
-                result.add(id(obj))
+                result.add(obj)  # pyldraw3 pieces hash by identity.
             pending = False
     return result
 
@@ -98,18 +109,12 @@ class Document:
         }
         self.piece_indices = {}
         self._index(self.view, "root", ())
-        for ident in self.placement_overrides:
-            if (
-                ident not in self.instances
-                or self.instances[ident]["kind"] == "model"
-                or self.instances[ident].get("generated")
-            ):
-                raise ValueError(f"Edit requires a type-1 occurrence ID: {ident!r}")
         for ident, text in self.placement_overrides.items():
-            from .editing import validate_placement
-
-            validate_placement(text, original=self.instances[ident]["source_text"])
-            self.instances[ident]["source_text"] = text
+            node = self.instances.get(ident)
+            if node is None or node["kind"] == "model" or node.get("generated"):
+                raise ValueError(f"Edit requires a type-1 occurrence ID: {ident!r}")
+            validate_placement(text, original=node["source_text"])
+            node["source_text"] = text
         self.selected_ids = self._select(sections)
 
     def _index(self, model, parent, visiting):
@@ -118,13 +123,13 @@ class Document:
         if key in visiting:
             raise ValueError("Assembly reference cycle: " + " -> ".join((*visiting, key)))
         for index, piece in enumerate(model.pieces):
-            generated = id(piece) in self.inline_pieces
+            generated = piece in self.inline_pieces
             if generated:
                 index = "inline"
-            self.piece_indices[id(piece)] = index
+            self.piece_indices[piece] = index
             instance_id = str(index) if parent == "root" else f"{parent}/{index}"
             child = self.view.submodels.get(normalized(piece.reference))
-            source = self.path if model is self.view else self.origins[id(model)]
+            source = self.path if model is self.view else self.origins[model]
             line = model.source_line_for(piece)
             self.instances[instance_id] = {
                 "id": instance_id,
@@ -201,12 +206,11 @@ class Document:
 
     def included(self, instance_id):
         return any(
-            selected == "root" or instance_id == selected or instance_id.startswith(selected + "/")
-            for selected in self.selected_ids
+            selected == "root" or within(instance_id, selected) for selected in self.selected_ids
         )
 
     def occurrence_id(self, occurrence):
-        return "/".join(str(self.piece_indices[id(p.piece)]) for p in occurrence.path)
+        return "/".join(str(self.piece_indices[p.piece]) for p in occurrence.path)
 
     def inventory(self):
         """JSON inventory requires source files only, not meshes or a parts library."""
@@ -227,7 +231,7 @@ class Document:
         if previous is not None and previous is not model:
             raise ValueError(f"Ambiguous reference {name!r} in {path}")
         self.models[key] = model
-        self.origins[id(model)] = path
+        self.origins[model] = path  # pyldraw3 models hash by identity.
 
     def _read(self, path, alias=None):
         try:
@@ -245,9 +249,9 @@ class Document:
         return root
 
     def _discover(self, model, visited):
-        if id(model) in visited:
+        if model in visited:
             return  # Instance indexing / surface expansion reports actual cycles.
-        visited.add(id(model))
+        visited.add(model)
         for obj in model.objects:
             if isinstance(obj, MetaCommand) and obj.type.upper() in {"TEXMAP", "DATA"}:
                 raise ValueError(
@@ -257,7 +261,7 @@ class Document:
             key = normalized(piece.reference)
             target = self.models.get(key)
             if target is None:
-                local = self.origins[id(model)].parent / piece.reference.replace("\\", "/")
+                local = self.origins[model].parent / piece.reference.replace("\\", "/")
                 if local.is_file():
                     target = self._read(local.resolve(), alias=piece.reference)
                 elif not key.endswith(".dat"):
@@ -280,17 +284,16 @@ class Document:
             # unqualified. Only recover an absent exact reference, never replace
             # existing library geometry or hide a malformed part.
             key = normalized(reference)
-            matches = {
-                id(m): m for m in self.models.values()
+            matches = [
+                m
+                for m in dict.fromkeys(self.models.values())
                 if key.endswith(".dat") and normalized(m.name).endswith(" - " + key)
-            }
+            ]
             if len(matches) > 1:
-                choices = ", ".join(sorted(m.name for m in matches.values()))
-                raise ValueError(
-                    f"Ambiguous embedded DAT for {reference!r}: {choices}"
-                ) from exc
+                choices = ", ".join(sorted(m.name for m in matches))
+                raise ValueError(f"Ambiguous embedded DAT for {reference!r}: {choices}") from exc
             if matches:
-                model = next(iter(matches.values()))
+                model = matches[0]
                 self.models[key] = model
                 self.reference_aliases[reference] = model.name
                 return model.objects
@@ -304,7 +307,7 @@ class Document:
         Keep all non-reference records in order so BFC state and face colours
         survive. References remain in their original assembly and retain their IDs.
         """
-        for model in list({id(m): m for m in self.models.values()}.values()):
+        for model in list(dict.fromkeys(self.models.values())):
             if model.name.casefold().endswith(".dat") or not any(
                 isinstance(obj, (Triangle, Quadrilateral)) for obj in model.objects
             ):
@@ -316,45 +319,43 @@ class Document:
                 name=name,
                 objects=[obj for obj in model.objects if not isinstance(obj, Piece)],
             )
-            self._register(name, inline, self.origins[id(model)])
+            self._register(name, inline, self.origins[model])
             piece = Piece.place(name, colour=16)
-            self.inline_pieces.add(id(piece))
+            self.inline_pieces.add(piece)
             model.objects = [
                 obj for obj in model.objects if not isinstance(obj, (Triangle, Quadrilateral))
             ] + [piece]
 
     def occurrences(self):
+        """Selected physical occurrences, with session placement overrides applied."""
+        result = []
         try:
-            return [
-                self._edited_occurrence(o)
-                if any(
-                    self.occurrence_id(o) == key or self.occurrence_id(o).startswith(key + "/")
-                    for key in self.placement_overrides
-                )
-                else o
-                for o in self.view.iter_occurrences()
-                if self.included(self.occurrence_id(o))
-            ]
+            for occurrence in self.view.iter_occurrences():
+                ident = self.occurrence_id(occurrence)
+                if not self.included(ident):
+                    continue
+                if any(within(ident, key) for key in self.placement_overrides):
+                    occurrence = self._edited_occurrence(occurrence)
+                result.append(occurrence)
         except PartError as exc:
             raise ValueError(f"Cannot expand {self.path}: {exc}") from exc
+        return result
 
     def _edited_occurrence(self, occurrence):
         """Expand a private path through pyldraw3; repeated source instances stay untouched."""
-        from .editing import validate_placement
-
         path = []
         indices = []
         for item in occurrence.path:
-            indices.append(str(self.piece_indices[id(item.piece)]))
+            indices.append(str(self.piece_indices[item.piece]))
             ident = "/".join(indices)
             piece = (
                 validate_placement(self.placement_overrides[ident])
                 if ident in self.placement_overrides
                 else item.piece
             )
-            self.piece_indices[id(piece)] = self.piece_indices[id(item.piece)]
-            if id(item.piece) in self.inverted:
-                self.inverted.add(id(piece))
+            self.piece_indices[piece] = self.piece_indices[item.piece]
+            if item.piece in self.inverted:
+                self.inverted.add(piece)
             path.append(replace(item, piece=piece))
         piece = path[-1].piece
         # A short private model chain lets pyldraw3 compose all ancestor affine
@@ -441,7 +442,7 @@ class Surfaces:
                 matrix, position = np.array(obj.matrix.rows), vector(obj.position)
                 check_transform(matrix, position, reference)
                 transformed = child.triangles @ matrix.T + position
-                if (np.linalg.det(matrix) < 0) != (id(obj) in inverted):
+                if (np.linalg.det(matrix) < 0) != (obj in inverted):
                     transformed = transformed[:, ::-1]
                 triangles.extend(transformed)
                 colours.extend(obj.colour if c.code == 16 else c for c in child.colours)
@@ -451,16 +452,3 @@ class Surfaces:
         )
         self.cache[key] = surface
         return surface
-
-
-def triangle_mesh(triangles):
-    mesh = trimesh.Trimesh(
-        vertices=triangles.reshape(-1, 3),
-        faces=np.arange(triangles.size // 3).reshape(-1, 3),
-        process=True,
-    )
-    # MuJoCo requires at least four vertices even for a zero-mass visual patch.
-    # Subdivision preserves a single triangle exactly, without adding thickness.
-    if len(mesh.vertices) < 4:
-        mesh = mesh.subdivide()
-    return mesh

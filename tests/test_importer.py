@@ -8,8 +8,9 @@ from ldraw import ConnectionFeature
 
 from ldraw_mujoco import import_ldraw
 from ldraw_mujoco.cli import main
-from ldraw_mujoco.geometry import BASIS, LDU_TO_METERS, Document, Surfaces, triangle_mesh
+from ldraw_mujoco.geometry import BASIS, LDU_TO_METERS, Document, Surfaces
 from ldraw_mujoco.library import load_library
+from ldraw_mujoco.meshes import triangle_mesh
 
 IDENTITY = "1 0 0 0 1 0 0 0 1"
 

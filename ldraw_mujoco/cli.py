@@ -135,13 +135,12 @@ def main(argv=None):
             # Check the artifact the user will actually load, before writing it.
             mujoco.MjModel.from_xml_string(xml)
             report_path = args.output.with_suffix(".import.json")
-            report_text = json.dumps(result.report, indent=2, allow_nan=False) + "\n"
-            args.output.parent.mkdir(parents=True, exist_ok=True)
+            write_json(report_path, result.report)  # Fails on non-JSON values before the XML.
             args.output.write_text(xml)
-            report_path.write_text(report_text)
             print(
                 f"Wrote {args.output} and {report_path}: "
-                f"{result.report['occurrence_count']} occurrences, {len(result.report['bodies'])} rigid bodies"
+                f"{result.report['occurrence_count']} occurrences, "
+                f"{len(result.report['bodies'])} bodies"
             )
         elif args.command == "hold":
             model = mujoco.MjModel.from_xml_path(str(args.input.resolve()))

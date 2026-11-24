@@ -7,7 +7,21 @@ import numpy as np
 import trimesh
 from ldraw import Colour
 
-from .geometry import BASIS, LDU_TO_METERS, Surfaces, triangle_mesh
+from .geometry import BASIS, LDU_TO_METERS, Surfaces
+
+
+def triangle_mesh(triangles):
+    """A trimesh mesh with merged vertices from an ``(n, 3, 3)`` triangle array."""
+    mesh = trimesh.Trimesh(
+        vertices=triangles.reshape(-1, 3),
+        faces=np.arange(triangles.size // 3).reshape(-1, 3),
+        process=True,
+    )
+    # MuJoCo requires at least four vertices even for a zero-mass visual patch.
+    # Subdivision preserves a single triangle exactly, without adding thickness.
+    if len(mesh.vertices) < 4:
+        mesh = mesh.subdivide()
+    return mesh
 
 
 def _hull(triangles, reference):

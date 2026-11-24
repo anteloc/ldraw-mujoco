@@ -13,6 +13,13 @@ import numpy as np
 from PIL import Image
 
 
+def _warnings(data):
+    """MuJoCo's warning counters that fired, by warning name."""
+    return {
+        mujoco.mjtWarning(i).name: int(w.number) for i, w in enumerate(data.warning) if w.number
+    }
+
+
 def _body_states(model, data):
     return [
         {
@@ -130,9 +137,7 @@ def _simulate(model, *, seconds=5.0, data=None, handle=None):
         _display(handle, data, "Finished" if valid else "Stopped: invalid physics")
     if valid:
         mujoco.mj_forward(model, data)  # mj_step leaves positions one step behind qpos.
-    warnings = {
-        mujoco.mjtWarning(i).name: int(w.number) for i, w in enumerate(data.warning) if w.number
-    }
+    warnings = _warnings(data)
     final = _body_states(model, data)
     for i, body in enumerate(final):
         body["displacement_m"] = (np.array(body["position_m"]) - initial[i]["position_m"]).tolist()
@@ -201,26 +206,22 @@ def hold(model, *, seconds=5.0, tolerance=0.002, settle=0.2, data=None):
     wall = time.perf_counter()
     mujoco.mj_forward(model, data)
     initial = _corners(model, data, geoms)
-    for _ in range(math.ceil(settle / timestep)):
-        mujoco.mj_step(model, data)
+    if settle_steps := math.ceil(settle / timestep):
+        mujoco.mj_step(model, data, nstep=settle_steps)
     mujoco.mj_forward(model, data)
     start, held_from = _corners(model, data, geoms), float(data.time)
     settled = _displacement(model, geoms, initial, start)
     moved = np.zeros(model.nbody)
     steps = math.ceil(seconds / timestep)
-    for step in range(1, steps + 1):
-        mujoco.mj_step(model, data)
-        if step % check and step < steps:
-            continue
+    for done in range(0, steps, check):
+        mujoco.mj_step(model, data, nstep=min(check, steps - done))
         # MuJoCo warns, then resets the state, when a simulation becomes unstable.
-        if any(w.number for w in data.warning) or not np.isfinite(data.qpos).all():
+        if _warnings(data) or not np.isfinite(data.qpos).all():
             break
         moved = np.maximum(moved, _displacement(model, geoms, start, _corners(model, data, geoms)))
         if moved.max() > tolerance:
             break
-    warnings = {
-        mujoco.mjtWarning(i).name: int(w.number) for i, w in enumerate(data.warning) if w.number
-    }
+    warnings = _warnings(data)
     valid = not warnings and bool(np.isfinite(data.qpos).all())
     if valid:
         mujoco.mj_forward(model, data)  # mj_step leaves positions one step behind qpos.
@@ -236,7 +237,7 @@ def hold(model, *, seconds=5.0, tolerance=0.002, settle=0.2, data=None):
         "wall_s": time.perf_counter() - wall,
         "solver": mujoco.mjtSolver(model.opt.solver).name.removeprefix("mjSOL_").lower(),
         "settle_displacement_m": float(settled[worst]),
-        "settle_body": model.body(worst).name,
+        "settle_body": model.body(worst).name if settled[worst] > 0 else None,
         "max_displacement_m": float(moved.max()),
         "moved_bodies": [
             {"name": model.body(i).name, "displacement_m": float(moved[i])} for i in movers
