@@ -359,6 +359,14 @@ design. They were taken with the importer as it was before this change.
 - **`simulate()` doubled the cost** with a second `mj_forward` after each step.
   It now reads positions one step late, refreshes them once at the end, and
   publishes to its browser viewer about 20 times per simulated second.
+- **Attached scenes overflowed MuJoCo's arena.** MuJoCo guesses `mjData`'s
+  arena from the DoFs, but its broadphase needs 8 bytes per pair of bodies on
+  the arena stack, and a stack overflow is fatal. Free bodies get gigabytes, but
+  attachment leaves many bodies with few DoFs. A 2,760-part attached scene
+  (nv 78) needed 31 MB of a 19 MB guess, and failed in its first
+  `mj_forward`. The importer's `_compile` now raises `<size memory>` to twice
+  that need, MuJoCo's 50 % worst-case target. With that, the same scene
+  peaked at 30.7 of 60.9 MB and held for 5 s.
 
 Results after this change, for the same garden (wall time of the check after
 XML loading):

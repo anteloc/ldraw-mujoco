@@ -9,6 +9,7 @@ from ldraw import ConnectionFeature
 from ldraw_mujoco import import_ldraw
 from ldraw_mujoco.cli import main
 from ldraw_mujoco.geometry import BASIS, LDU_TO_METERS, Document, Surfaces
+from ldraw_mujoco.importer import _compile
 from ldraw_mujoco.library import load_library
 from ldraw_mujoco.meshes import triangle_mesh
 
@@ -436,3 +437,29 @@ def test_prefixed_dat_does_not_replace_exact_document_part(build, small_library)
     )
     assert result.report["reference_aliases"] == {}
     assert result.spec.compile().body_mass[1] > 0
+
+
+def welded_bodies(count):
+    """One free root with ``count - 1`` jointless children: many bodies, nv 6."""
+    spec = mujoco.MjSpec()
+    root = spec.worldbody.add_body(name="root", pos=[0, 0, 0.1])
+    root.add_freejoint()
+    for index in range(count):
+        body = root if index == 0 else root.add_body(pos=[0.03 * (index % 50), 0.03 * (index // 50), 0])
+        body.add_geom(type=mujoco.mjtGeom.mjGEOM_BOX, size=[0.01] * 3)
+    return spec
+
+
+def test_arena_makes_room_for_the_broadphase_of_attached_bodies():
+    # MuJoCo sizes the arena from nv; its broadphase needs 8 bytes per body pair.
+    spec = welded_bodies(2000)
+    with pytest.raises(mujoco.FatalError, match="stack overflow at mj_broadphase"):
+        mujoco.mj_forward(model := spec.compile(), mujoco.MjData(model))
+    model = _compile(spec)
+    for model in (model, mujoco.MjModel.from_xml_string(spec.to_xml())):
+        data = mujoco.MjData(model)
+        mujoco.mj_forward(model, data)
+        assert data.maxuse_arena < 0.55 * model.narena  # About MuJoCo's 50 % target.
+
+    small = welded_bodies(10)
+    assert _compile(small).narena == small.compile().narena  # MuJoCo's own guess stays.

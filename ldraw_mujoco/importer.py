@@ -145,7 +145,7 @@ def import_ldraw(
     offset = np.array([0.0, 0.0, clearance - placed.low[2]])
     _build_bodies(spec, bodies, tree, loops, offset, joint_friction)
     # Compile here to fail before a CLI writes a successful-looking artifact.
-    model = spec.compile()
+    model = _compile(spec)
 
     ids = [o["id"] for o in placed.occurrences]
     unlinked = _unlinked(contacts, ids)
@@ -417,6 +417,25 @@ def _build_bodies(spec, bodies, tree, loops, offset, joint_friction):
             data=[*(to_mujoco(link.point) - first["origin"]), *[0.0] * 8],
         )
         spec.add_exclude(bodyname1=first["name"], bodyname2=second["name"])
+
+
+def _compile(spec):
+    """Compile, giving MuJoCo's broadphase room when the default arena lacks it.
+
+    MuJoCo guesses the size of mjData's arena from the degrees of freedom, but
+    its broadphase puts two int buffers per pair of bodies on the arena stack,
+    and a stack overflow is fatal. Attachment leaves many bodies with few DoFs:
+    2,760 attached parts (nv 78) needed 31 MB of a 19 MB arena. The arena is
+    therefore at least twice that need, MuJoCo's 50 % worst-case use target.
+    The size is saved in the XML as ``<size memory=...>``.
+    """
+    model = spec.compile()
+    pairs = (model.nbody - 1) * (model.nbody - 2) // 2  # Pairs of non-world bodies.
+    broadphase = 8 * pairs
+    if 2 * broadphase > model.narena:
+        spec.memory = 2 * broadphase
+        model = spec.compile()
+    return model
 
 
 def _name(text):
